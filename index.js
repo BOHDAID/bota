@@ -1,40 +1,41 @@
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 const { Telegraf, Markup } = require('telegraf');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const mongoose = require('mongoose');
-const express = require('express'); // 1. استدعاء مكتبة السيرفر
+const express = require('express');
+const axios = require('axios'); // تأكدنا من إضافتها
 
 // ============================================================
-// 🌍 إعداد السيرفر الوهمي (لإرضاء Render)
+// 🌍 1. إعداد السيرفر (أول خطوة لمنع أخطاء Render)
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    res.send('🤖 Bot is Running Successfully!');
+    res.send('✅ Bot is Running...');
 });
 
 app.listen(PORT, () => {
-    console.log(`✅ Web Server running on port ${PORT}`);
+    console.log(`✅ Server running on port ${PORT}`);
 });
 
 // ============================================================
-// 🔐 المتغيرات السرية (من إعدادات Render)
+// 🔐 2. المتغيرات البيئية (من Render)
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
 
-if (!TELEGRAM_BOT_TOKEN || !MONGO_URI) {
-    console.error("❌ خطأ: لم تقم بوضع التوكن أو رابط القاعدة في متغيرات البيئة!");
-    process.exit(1);
+// التحقق من وجود المتغيرات
+if (!TELEGRAM_BOT_TOKEN || !ADMIN_ID || !MONGO_URI) {
+    console.error("❌ خطأ: تأكد من إضافة BOT_TOKEN و ADMIN_ID و MONGO_URI في إعدادات Render Environment Variables");
+    // لن نوقف العملية لتجنب انهيار السيرفر، لكن البوت لن يعمل بشكل صحيح
 }
 
 // ============================================================
-// ☁️ الاتصال بقاعدة البيانات
+// ☁️ 3. قاعدة البيانات
 // ============================================================
 mongoose.connect(MONGO_URI)
     .then(() => {
@@ -54,19 +55,33 @@ const Setting = mongoose.model('Setting', settingSchema);
 const Reply = mongoose.model('Reply', replySchema);
 const History = mongoose.model('History', historySchema);
 
+// متغيرات الذاكرة
 const sessions = {}; 
 const userStates = {}; 
 let ADMIN_USERNAME_CACHE = '';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 // ============================================================
-// 🛡️ منع الانهيار
+// 🛡️ 4. حماية النظام
 // ============================================================
 process.on('uncaughtException', (err) => console.log('⚠️ Error:', err.message));
 process.on('unhandledRejection', (err) => console.log('⚠️ Rejection:', err.message));
 
+// إصلاح ملفات الواتساب
+const libFile = path.join(__dirname, 'node_modules', 'whatsapp-web.js', 'src', 'Client.js');
+try {
+    if (fs.existsSync(libFile)) {
+        let content = fs.readFileSync(libFile, 'utf8');
+        if (content.includes('window.WWebJS.markedUnread')) {
+            content = content.replace(/window\.WWebJS\.markedUnread/g, '(()=>true)');
+            content = content.replace(/window\.WWebJS\.sendSeen/g, '(()=>true)');
+            fs.writeFileSync(libFile, content, 'utf8');
+        }
+    }
+} catch (err) {}
+
 // ============================================================
-// 🤖 البوت
+// 🤖 5. كود البوت
 // ============================================================
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
@@ -79,7 +94,7 @@ async function fetchAdmin() {
         }
     } catch (e) {}
 }
-fetchAdmin();
+if(ADMIN_ID) fetchAdmin(); // تشغيل فقط إذا كان الآيدي موجوداً
 
 async function restoreSessions() {
     console.log('🔄 استعادة الجلسات...');
@@ -97,13 +112,11 @@ async function restoreSessions() {
     }
 }
 
-// ============================================================
 // 🏭 إدارة الجلسات
-// ============================================================
 async function startUserSession(userId, ctx) {
     if (sessions[userId]) {
         if (sessions[userId].status === 'READY') {
-            if (ctx) ctx.reply('✅ **أنت متصل بالفعل!**', Markup.inlineKeyboard([[Markup.button.callback('📂 الذهاب للخدمات', 'services_menu')], [Markup.button.callback('❌ تسجيل خروج', 'logout')]]));
+            if (ctx) ctx.reply('✅ **أنت متصل بالفعل!**', Markup.inlineKeyboard([[Markup.button.callback('📂 الخدمات', 'services_menu')], [Markup.button.callback('❌ خروج', 'logout')]]));
             return;
         }
         if (sessions[userId].status === 'QR_SENT') return;
@@ -115,7 +128,7 @@ async function startUserSession(userId, ctx) {
         authStrategy: new LocalAuth({ clientId: `user_${userId}` }),
         puppeteer: { 
             headless: true, 
-            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] // إعدادات مهمة للسيرفرات
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] 
         }
     });
 
@@ -140,6 +153,7 @@ async function startUserSession(userId, ctx) {
     client.on('ready', () => {
         sessions[userId].status = 'READY';
         if(ctx) bot.telegram.sendMessage(userId, '✅ **تم الربط بنجاح!**').catch(()=>{});
+        console.log(`User ${userId} Ready`);
     });
 
     client.on('auth_failure', () => { sessions[userId].status = 'FAILED'; if(ctx) ctx.reply('❌ فشل الاتصال.'); });
@@ -161,14 +175,14 @@ async function startUserSession(userId, ctx) {
 
 bot.action('retry_login', async (ctx) => {
     const userId = ctx.from.id.toString();
-    ctx.editMessageText('🔄 **تحديث...**');
+    ctx.editMessageText('🔄 **تحديث...**').catch(()=>{});
     await cleanupSession(userId);
     await startUserSession(userId, ctx); 
 });
 
 bot.action('logout', async (ctx) => {
     const userId = ctx.from.id.toString();
-    ctx.editMessageText('⏳ **خروج...**');
+    ctx.editMessageText('⏳ **خروج...**').catch(()=>{});
     await cleanupSession(userId);
     ctx.reply('✅ **تم.**', Markup.inlineKeyboard([[Markup.button.callback('🔙 القائمة', 'main_menu')]]));
 });
@@ -179,14 +193,12 @@ async function cleanupSession(userId) {
     if (fs.existsSync(sessionDir)) { try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {} }
 }
 
-// ============================================================
 // 🔐 التحقق
-// ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
     const userId = ctx.from.id.toString();
     try { await History.create({ _id: userId, date: Date.now() }); } catch(e) {} 
-    const isAdmin = (userId == ADMIN_ID); // استخدام == لمطابقة النص والرقم
+    const isAdmin = (userId == ADMIN_ID);
 
     if (!isAdmin) {
         const setting = await Setting.findOne({ key: 'force_channel' });
@@ -210,9 +222,7 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-// ============================================================
 // 📱 القوائم
-// ============================================================
 async function showMainMenu(ctx) {
     const userId = ctx.from.id.toString();
     const isAdmin = (userId == ADMIN_ID);
@@ -279,7 +289,7 @@ async function activateUser(ctx, targetId, days) {
     await bot.telegram.sendMessage(targetId, `🎉 تم التفعيل ${days} يوم.`).catch(()=>{});
     if(ctx.updateType === 'callback_query') ctx.editMessageText('✅ تم.');
 }
-bot.action(/reject_(.+)/, (ctx) => { bot.telegram.sendMessage(ctx.match[1], '❌ مرفوض.'); ctx.editMessageText('❌ تم الرفض.'); });
+bot.action(/reject_(.+)/, (ctx) => { bot.telegram.sendMessage(ctx.match[1], '❌ مرفوض.').catch(()=>{}); ctx.editMessageText('❌ تم الرفض.'); });
 
 bot.action('open_dashboard', async (ctx) => { await startUserSession(ctx.from.id.toString(), ctx); });
 bot.action('fetch_groups', async (ctx) => {
@@ -403,13 +413,6 @@ bot.on(['text', 'photo', 'video'], async (ctx) => {
 
 bot.action('stop_pub', (ctx) => { if(sessions[ctx.from.id]) sessions[ctx.from.id].publishing = false; ctx.reply('🛑 تم.'); });
 
-// 🚀 تشغيل البوت
-const PORT = process.env.PORT || 3000;
-const express = require('express');
-const app = express();
-app.get('/', (req, res) => res.send('Bot Running'));
-app.listen(PORT, () => {
-    bot.launch();
-    console.log(`Server running on port ${PORT}`);
-});
-process.once('SIGINT', () => bot.stop());
+// 🚀 تشغيل البوت مع Express (لضمان Render)
+bot.launch();
+console.log('Bot Launched');
