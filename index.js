@@ -8,41 +8,29 @@ const express = require('express');
 const axios = require('axios');
 
 // ============================================================
-// 1. إعداد السيرفر الوهمي (لإبقاء Render يعمل)
+// 1. سيرفر Render الوهمي
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 3000;
-
-app.get('/', (req, res) => {
-    res.send('✅ Bot is Running Successfully on Render!');
-});
-
-app.listen(PORT, () => {
-    console.log(`✅ Web Server running on port ${PORT}`);
-});
+app.get('/', (req, res) => res.send('✅ Bot is Running (Low Memory Mode)'));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
-// 2. التحقق من المتغيرات
+// 2. إعدادات ومتغيرات
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
 
-if (!TELEGRAM_BOT_TOKEN || !MONGO_URI) {
-    console.error("❌ CRITICAL ERROR: BOT_TOKEN or MONGO_URI is missing in Environment Variables.");
-}
+if (!TELEGRAM_BOT_TOKEN || !MONGO_URI) console.error("❌ المتغيرات ناقصة!");
 
-// ============================================================
-// 3. الاتصال بقاعدة البيانات
-// ============================================================
 mongoose.connect(MONGO_URI)
     .then(() => {
         console.log('✅ MongoDB Connected!');
-        restoreSessions(); // استعادة الجلسات تلقائياً
+        restoreSessions(); 
     })
     .catch(err => console.error('❌ MongoDB Error:', err));
 
-// تعريف الجداول
 const userSchema = new mongoose.Schema({ _id: String, expiry: Number });
 const settingSchema = new mongoose.Schema({ key: String, value: String });
 const replySchema = new mongoose.Schema({ userId: String, keyword: String, response: String });
@@ -53,20 +41,14 @@ const Setting = mongoose.model('Setting', settingSchema);
 const Reply = mongoose.model('Reply', replySchema);
 const History = mongoose.model('History', historySchema);
 
-// متغيرات الذاكرة
 const sessions = {}; 
 const userStates = {}; 
 let ADMIN_USERNAME_CACHE = '';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ============================================================
-// 4. البوت والتعامل مع الأخطاء
-// ============================================================
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-bot.catch((err, ctx) => {
-    console.error(`❌ Telegraf Error:`, err);
-});
+bot.catch((err) => console.log('Telegraf Error:', err));
 
 // جلب يوزر المدير
 async function fetchAdmin() {
@@ -81,9 +63,9 @@ async function fetchAdmin() {
 }
 fetchAdmin();
 
-// استعادة الجلسات
+// استعادة الجلسات (بشكل متسلسل لتخفيف الضغط)
 async function restoreSessions() {
-    console.log('🔄 Checking saved sessions...');
+    console.log('🔄 استعادة الجلسات...');
     const authPath = path.join(__dirname, '.wwebjs_auth');
     if (fs.existsSync(authPath)) {
         const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_user_'));
@@ -93,7 +75,7 @@ async function restoreSessions() {
                 const user = await User.findById(userId);
                 if (user && user.expiry > Date.now()) {
                     await startUserSession(userId, null); 
-                    await sleep(5000);
+                    await sleep(10000); // انتظار 10 ثواني بين كل جلسة لعدم خنق السيرفر
                 }
             } catch (e) {}
         }
@@ -101,10 +83,14 @@ async function restoreSessions() {
 }
 
 // ============================================================
-// 5. محرك الواتساب (Puppeteer)
+// 3. إدارة الجلسات (وضع توفير الرام)
 // ============================================================
 async function startUserSession(userId, ctx) {
-    // منع التكرار
+    // تنظيف أي جلسة عالقة قبل البدء
+    if (sessions[userId] && sessions[userId].status === 'FAILED') {
+        await cleanupSession(userId);
+    }
+
     if (sessions[userId]) {
         if (sessions[userId].status === 'READY') {
             if (ctx) ctx.reply('✅ **متصل.**', Markup.inlineKeyboard([[Markup.button.callback('📂 الخدمات', 'services_menu')], [Markup.button.callback('❌ خروج', 'logout')]]));
@@ -113,13 +99,16 @@ async function startUserSession(userId, ctx) {
         if (sessions[userId].status === 'QR_SENT') return;
     }
 
-    if (ctx) ctx.editMessageText('⚙️ **جاري التشغيل...**').catch(()=>{});
+    if (ctx) ctx.editMessageText('⚙️ **جاري التشغيل (وضع خفيف)...**').catch(()=>{});
 
-    // إعدادات كروم الخاصة بـ Render
     const client = new Client({
-        authStrategy: new LocalAuth({ clientId: `user_${userId}` }),
+        authStrategy: new LocalAuth({ 
+            clientId: `user_${userId}`,
+            dataPath: path.join(__dirname, '.wwebjs_auth') // تحديد مسار واضح
+        }),
         puppeteer: { 
             headless: true,
+            // 🛑 إعدادات خفض استهلاك الرام لأقصى حد 🛑
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
@@ -128,9 +117,17 @@ async function startUserSession(userId, ctx) {
                 '--no-first-run',
                 '--no-zygote',
                 '--single-process', 
-                '--disable-gpu'
+                '--disable-gpu',
+                '--disable-extensions',
+                '--disable-software-rasterizer',
+                '--mute-audio',
+                '--disable-gl-drawing-for-tests',
+                '--window-size=800,600'
             ] 
-        }
+        },
+        // زيادة وقت الانتظار لأن السيرفر بطيء
+        qrMaxRetries: 3,
+        authTimeoutMs: 60000, 
     });
 
     sessions[userId] = { client: client, selected: [], publishing: false, groups: [], status: 'INITIALIZING' };
@@ -144,8 +141,8 @@ async function startUserSession(userId, ctx) {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
                 await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز**\nإذا لم يظهر، اضغط تحديث.',
-                    ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث الرمز', 'retry_login')]])
+                    caption: '📱 **امسح الرمز**\n⚠️ السيرفر مجاني وقد يستغرق الربط دقيقة.\nإذا علق، اضغط زر التحديث بالأسفل.',
+                    ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث الرمز / إعادة ضبط', 'retry_login')]])
                 });
             } catch (e) {}
         }
@@ -153,17 +150,21 @@ async function startUserSession(userId, ctx) {
 
     client.on('ready', () => {
         sessions[userId].status = 'READY';
-        console.log(`User ${userId} Ready`);
+        console.log(`✅ User ${userId} Connected!`);
         if(ctx) bot.telegram.sendMessage(userId, '✅ **تم الربط بنجاح!**').catch(()=>{});
     });
 
     client.on('auth_failure', () => { 
+        console.error(`❌ Auth Failed for ${userId}`);
         sessions[userId].status = 'FAILED'; 
-        if(ctx) ctx.reply('❌ فشل المصادقة.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
+        if(ctx) ctx.reply('❌ فشل الربط. اضغط تحديث.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
     });
 
-    client.on('disconnected', () => { 
+    client.on('disconnected', (reason) => { 
+        console.warn(`⚠️ Disconnected ${userId}: ${reason}`);
         if (sessions[userId]) sessions[userId].status = 'DISCONNECTED'; 
+        // تنظيف تلقائي عند الانفصال لتجنب التعليق
+        cleanupSession(userId);
     });
 
     client.on('message', async (msg) => {
@@ -182,16 +183,35 @@ async function startUserSession(userId, ctx) {
     try { 
         await client.initialize(); 
     } catch (error) { 
-        console.error(`❌ Puppeteer Error (${userId}):`, error);
-        if(ctx) ctx.reply('❌ خطأ في المتصفح. حاول مجدداً.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
+        console.error(`❌ Puppeteer Error (${userId}):`, error.message);
+        if(ctx) ctx.reply('❌ السيرفر مشغول. حاول مرة أخرى.', Markup.inlineKeyboard([[Markup.button.callback('🔄 إعادة ضبط', 'retry_login')]]));
+        await cleanupSession(userId); // تنظيف فوري عند الخطأ
     }
 }
 
+// زر التحديث (يقوم بتنظيف قوي جداً)
 bot.action('retry_login', async (ctx) => {
     const userId = ctx.from.id.toString();
-    ctx.editMessageText('🔄 **تحديث...**').catch(()=>{});
-    await cleanupSession(userId);
-    await startUserSession(userId, ctx); 
+    try {
+        await ctx.editMessageText('🧹 **جاري تنظيف الذاكرة وإعادة المحاولة...**');
+        
+        // 1. قتل الجلسة الحالية
+        if (sessions[userId]) {
+            try { await sessions[userId].client.destroy(); } catch (e) {}
+            delete sessions[userId];
+        }
+
+        // 2. حذف ملفات الجلسة من القرص (Reset Hard)
+        const sessionDir = path.join(__dirname, '.wwebjs_auth', `session_user_${userId}`);
+        if (fs.existsSync(sessionDir)) {
+            try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
+        }
+
+        await sleep(2000); // انتظار لضمان التنظيف
+        await startUserSession(userId, ctx); 
+    } catch (e) {
+        ctx.reply('خطأ في إعادة الضبط.');
+    }
 });
 
 bot.action('logout', async (ctx) => {
@@ -202,13 +222,18 @@ bot.action('logout', async (ctx) => {
 });
 
 async function cleanupSession(userId) {
-    if (sessions[userId]) { try { await sessions[userId].client.destroy(); } catch (e) {} delete sessions[userId]; }
+    if (sessions[userId]) { 
+        try { await sessions[userId].client.destroy(); } catch (e) {} 
+        delete sessions[userId]; 
+    }
     const sessionDir = path.join(__dirname, '.wwebjs_auth', `session_user_${userId}`);
-    if (fs.existsSync(sessionDir)) { try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {} }
+    if (fs.existsSync(sessionDir)) { 
+        try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {} 
+    }
 }
 
 // ============================================================
-// 6. Middleware (الحماية)
+// 4. Middleware & Handlers
 // ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
@@ -239,9 +264,7 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-// ============================================================
-// 7. واجهة المستخدم
-// ============================================================
+// القوائم
 async function showMainMenu(ctx) {
     const userId = ctx.from.id.toString();
     const isAdmin = (userId == ADMIN_ID);
@@ -276,6 +299,7 @@ async function showServicesMenu(ctx) {
 bot.start((ctx) => showMainMenu(ctx));
 bot.action('main_menu', (ctx) => showMainMenu(ctx));
 bot.action('services_menu', (ctx) => showServicesMenu(ctx));
+bot.action('open_dashboard', (ctx) => startUserSession(ctx.from.id.toString(), ctx));
 
 bot.action('check_my_sub', async (ctx) => {
     const userId = ctx.from.id.toString();
@@ -287,9 +311,6 @@ bot.action('check_my_sub', async (ctx) => {
     } else { ctx.reply('⛔ منتهي.'); }
 });
 
-// ============================================================
-// 8. الاشتراكات
-// ============================================================
 bot.action('req_sub', async (ctx) => {
     const adminSet = await Setting.findOne({ key: 'admin_user' });
     ctx.editMessageText(`✅ تم الإرسال.`, Markup.inlineKeyboard([[Markup.button.url('تواصل', `https://t.me/${adminSet ? adminSet.value : 'Admin'}`)]]));
@@ -297,37 +318,17 @@ bot.action('req_sub', async (ctx) => {
         Markup.inlineKeyboard([[Markup.button.callback('30 يوم', `act_${ctx.from.id}_30`), Markup.button.callback('يدوي', `manual_days_${ctx.from.id}`)], [Markup.button.callback('رفض', `reject_${ctx.from.id}`)]]));
 });
 
-bot.action(/act_(.+)_(.+)/, async (ctx) => { 
-    await activateUser(ctx, ctx.match[1], parseInt(ctx.match[2])); 
-});
-bot.action(/manual_days_(.+)/, (ctx) => { 
-    userStates[ADMIN_ID] = { step: 'TYPE_DAYS_FOR_REQ', targetId: ctx.match[1] }; 
-    ctx.reply('🔢 عدد الايام:'); 
-});
-
+bot.action(/act_(.+)_(.+)/, async (ctx) => { await activateUser(ctx, ctx.match[1], parseInt(ctx.match[2])); });
+bot.action(/manual_days_(.+)/, (ctx) => { userStates[ADMIN_ID] = { step: 'TYPE_DAYS_FOR_REQ', targetId: ctx.match[1] }; ctx.reply('🔢 عدد الايام:'); });
 async function activateUser(ctx, targetId, days) {
-    try {
-        await User.findByIdAndUpdate(targetId, { expiry: Date.now() + (days * 86400000) }, { upsert: true });
-        await bot.telegram.sendMessage(targetId, `🎉 تم التفعيل ${days} يوم.`).catch(()=>{});
-        if(ctx.updateType === 'callback_query') ctx.editMessageText('✅ تم التفعيل.');
-        else ctx.reply('✅ تم التفعيل.');
-    } catch (e) { ctx.reply('خطأ.'); }
+    await User.findByIdAndUpdate(targetId, { expiry: Date.now() + (days * 86400000) }, { upsert: true });
+    await bot.telegram.sendMessage(targetId, `🎉 تم التفعيل ${days} يوم.`).catch(()=>{});
+    if(ctx.updateType==='callback_query') ctx.editMessageText('✅ تم التفعيل.');
 }
-
 bot.action(/reject_(.+)/, async (ctx) => { 
-    const targetId = ctx.match[1];
-    try {
-        await bot.telegram.sendMessage(targetId, '❌ تم رفض الطلب.').catch(()=>{});
-        ctx.editMessageText('❌ تم الرفض.'); 
-    } catch (e) {
-        ctx.reply('خطأ في الرفض.');
-    }
+    try { await bot.telegram.sendMessage(ctx.match[1], '❌ تم الرفض.').catch(()=>{}); } catch(e){}
+    ctx.editMessageText('❌ تم الرفض.'); 
 });
-
-// ============================================================
-// 9. لوحة المستخدم
-// ============================================================
-bot.action('open_dashboard', (ctx) => startUserSession(ctx.from.id.toString(), ctx));
 
 bot.action('fetch_groups', async (ctx) => {
     const s = sessions[ctx.from.id.toString()];
@@ -354,14 +355,13 @@ bot.action(/sel_(.+)/, (ctx) => {
 });
 bot.action('sel_all', (ctx) => { sessions[ctx.from.id.toString()].selected = sessions[ctx.from.id.toString()].groups.map(g => g.id._serialized); sendGroupMenu(ctx, ctx.from.id.toString()); });
 bot.action('desel_all', (ctx) => { sessions[ctx.from.id.toString()].selected = []; sendGroupMenu(ctx, ctx.from.id.toString()); });
-bot.action('done_sel', (ctx) => { ctx.answerCbQuery('تم الحفظ'); showServicesMenu(ctx); });
+bot.action('done_sel', (ctx) => { ctx.answerCbQuery('حفظ'); showServicesMenu(ctx); });
 
 bot.action('broadcast', (ctx) => {
     if (!sessions[ctx.from.id.toString()]?.selected.length) return ctx.reply('⚠️ اختر الجروبات.');
     userStates[ctx.from.id.toString()] = { step: 'WAIT_CONTENT' };
     ctx.reply('📝 أرسل المحتوى:');
 });
-
 bot.action('my_replies', async (ctx) => {
     const count = await Reply.countDocuments({ userId: ctx.from.id.toString() });
     ctx.editMessageText(`🤖 ردود: ${count}`, Markup.inlineKeyboard([[Markup.button.callback('➕', 'add_rep'), Markup.button.callback('❌', 'del_rep')], [Markup.button.callback('🔙', 'services_menu')]]));
@@ -369,9 +369,6 @@ bot.action('my_replies', async (ctx) => {
 bot.action('add_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_KEYWORD' }; ctx.reply('الكلمة؟'); });
 bot.action('del_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_DEL_KEY' }; ctx.reply('للحذف؟'); });
 
-// ============================================================
-// 10. لوحة المدير
-// ============================================================
 bot.action('admin_panel', async (ctx) => {
     const total = await User.countDocuments();
     ctx.editMessageText(`🛠️ ${total} مشترك`, Markup.inlineKeyboard([[Markup.button.callback('➕ تفعيل', 'adm_add'), Markup.button.callback('❌ حذف', 'adm_del')], [Markup.button.callback('📢 برودكاست', 'adm_cast'), Markup.button.callback('🔒 قناة', 'adm_force')], [Markup.button.callback('🔙', 'main_menu')]]));
@@ -381,9 +378,6 @@ bot.action('adm_del', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_DEL_ID' }; 
 bot.action('adm_cast', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CAST' }; ctx.reply('الرسالة؟'); });
 bot.action('adm_force', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CHAN' }; ctx.reply('اليوزر؟ (أو off)'); });
 
-// ============================================================
-// 11. المعالج
-// ============================================================
 bot.on(['text', 'photo', 'video'], async (ctx) => {
     const userId = ctx.from.id.toString();
     const text = ctx.message.caption || ctx.message.text || ''; 
@@ -400,7 +394,7 @@ bot.on(['text', 'photo', 'video'], async (ctx) => {
             userStates[userId] = null; return ctx.reply('تم.');
         }
         if (step === 'ADM_CHAN') {
-            if(text==='off') await Setting.findOneAndDelete({key:'force_channel'});
+            if(text==='off' || text==='حذف') await Setting.findOneAndDelete({key:'force_channel'});
             else await Setting.findOneAndUpdate({key:'force_channel'},{value:text},{upsert:true});
             userStates[userId] = null; return ctx.reply('تم.');
         }
@@ -452,11 +446,7 @@ bot.on(['text', 'photo', 'video'], async (ctx) => {
         bot.telegram.sendMessage(userId, `✅ انتهى: ${sent}`);
     }
 });
+bot.action('stop_pub', (ctx) => { if(sessions[ctx.from.id]) sessions[ctx.from.id].publishing = false; ctx.reply('🛑 تم.'); });
 
-bot.action('stop_pub', (ctx) => { 
-    if(sessions[ctx.from.id]) sessions[ctx.from.id].publishing = false; 
-    ctx.reply('🛑 تم.'); 
-});
-
-bot.launch().then(() => console.log('🤖 Telegram Bot Started!'));
-process.once('SIGINT', () => bot.stop('SIGINT'));
+bot.launch();
+process.once('SIGINT', () => bot.stop());
