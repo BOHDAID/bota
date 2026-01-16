@@ -11,11 +11,11 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Final Bot is Running (Full Version)'));
+app.get('/', (req, res) => res.send('✅ Bot is Running (Final Full Version)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
-// 2. إعدادات قاعدة البيانات
+// 2. إعدادات قاعدة البيانات والمتغيرات
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
@@ -42,7 +42,6 @@ const History = mongoose.model('History', historySchema);
 // متغيرات الذاكرة
 const sessions = {}; 
 const userStates = {}; 
-let ADMIN_USERNAME_CACHE = '';
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -52,20 +51,19 @@ bot.catch((err, ctx) => {
     console.log(`⚠️ Telegraf Error for ${ctx.updateType}:`, err.message);
 });
 
-// جلب يوزر المدير تلقائياً
+// حفظ اسم المدير للتواصل
 async function fetchAdmin() {
     if (!ADMIN_ID) return;
     try {
         const chat = await bot.telegram.getChat(ADMIN_ID);
         if(chat.username) {
-            ADMIN_USERNAME_CACHE = chat.username;
             await Setting.findOneAndUpdate({ key: 'admin_user' }, { value: chat.username }, { upsert: true });
         }
     } catch (e) {}
 }
 fetchAdmin();
 
-// استعادة الجلسات النشطة
+// استعادة الجلسات النشطة عند تشغيل السيرفر
 async function restoreSessions() {
     const authPath = './auth_info';
     if (fs.existsSync(authPath)) {
@@ -93,7 +91,7 @@ async function startBaileysSession(userId, ctx) {
     const sessionDir = `./auth_info/session_${userId}`;
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     
-    // جلب أحدث إصدار لتفادي الحظر 405
+    // جلب أحدث إصدار لتفادي حظر 405
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -102,7 +100,7 @@ async function startBaileysSession(userId, ctx) {
         printQRInTerminal: false,
         auth: state,
         browser: Browsers.macOS('Desktop'),
-        syncFullHistory: false, // ⛔ توفير الرام (مهم جداً)
+        syncFullHistory: false, // ⛔ هام جداً لتوفير الرام
         connectTimeoutMs: 60000, 
         retryRequestDelayMs: 5000, // 🛑 تأخير 5 ثواني لمنع التكرار السريع
         keepAliveIntervalMs: 30000
@@ -218,7 +216,7 @@ bot.use(async (ctx, next) => {
 });
 
 // ============================================================
-// 5. واجهة المستخدم (القوائم)
+// 5. واجهة المستخدم (القوائم الرئيسية)
 // ============================================================
 async function showMainMenu(ctx) {
     const userId = ctx.from.id.toString();
@@ -285,7 +283,7 @@ bot.action('retry_login', async (ctx) => {
     if (sessions[userId]) delete sessions[userId];
     if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
     
-    try { await ctx.deleteMessage(); } catch(e) {} // حذف الصورة لتجنب الخطأ
+    try { await ctx.deleteMessage(); } catch(e) {} // حذف الصورة لتجنب خطأ التعديل
     
     await ctx.reply('🔄 **جاري إعادة التعيين...**');
     setTimeout(() => startBaileysSession(userId, ctx), 2000);
@@ -453,4 +451,4 @@ bot.on('text', async (ctx) => {
 });
 
 bot.launch();
-process.once('SIGINT', () => bot.stop());v
+process.once('SIGINT', () => bot.stop());
