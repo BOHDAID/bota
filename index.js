@@ -5,11 +5,17 @@ const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const express = require('express');
 
+// ============================================================
+// 1. سيرفر Render
+// ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Ultra Light Mode)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Ghost Mode - No Sync)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
+// ============================================================
+// 2. إعدادات
+// ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
@@ -22,10 +28,16 @@ const Reply = mongoose.model('Reply', new mongoose.Schema({ userId: String, keyw
 const sessions = {}; 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
+// ذاكرة مؤقتة لمنع إعادة طلب الرسائل (يحل مشكلة التعليق)
+const msgRetryCounterCache = new Map();
+
+// ============================================================
+// 3. محرك Baileys (نظام الشبح)
+// ============================================================
 async function startBaileysSession(userId, ctx, phoneNumber = null) {
     const sessionDir = `./auth_info/session_${userId}`;
     
-    // تنظيف كامل قبل البدء
+    // تنظيف إذا كان طلب ربط جديد
     if (phoneNumber && fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -35,34 +47,38 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
 
     const sock = makeWASocket({
         version,
-        logger: pino({ level: 'silent' }),
+        logger: pino({ level: 'silent' }), // تقليل الضغط على المعالج
         printQRInTerminal: false,
         auth: state,
-        // استخدام توقيع Ubuntu وهو الأسرع والأخف لسيرفرات Render
+        // 🔥 استخدام توقيع متصفح خفيف جداً
         browser: ['Ubuntu', 'Chrome', '20.0.04'],
-        // ⛔ منع تحميل أي شيء قديم لتسريع الربط
-        syncFullHistory: false, 
-        markOnlineOnConnect: false,
-        generateHighQualityLinkPreview: false,
-        // إعدادات الشبكة
+        msgRetryCounterCache, // 🛑 ضروري جداً لمنع التكرار
+        syncFullHistory: false, // ⛔ لا تحمل التاريخ
+        markOnlineOnConnect: false, // لا تظهر متصل
+        generateHighQualityLinkPreview: false, // لا تحمل صور الروابط
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 20000,
-        retryRequestDelayMs: 3000
+        keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 2000,
+        // دالة ضرورية لمنع الانهيار عند فقدان رسالة
+        getMessage: async (key) => {
+            return { conversation: 'hello' };
+        }
     });
 
     sessions[userId] = { sock };
 
+    // 🔥 طلب رمز الربط
     if (phoneNumber && !sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 let cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-                await delay(3000); 
+                await delay(2000); 
                 const code = await sock.requestPairingCode(cleanNumber);
-                if (ctx) ctx.reply(`🔢 **رمز الربط:**\n\`${code}\`\n\n⚡ **بسرعة!** ضعه في واتساب الآن.\n⚠️ وافق على رسالة "الاحتيال" إذا ظهرت.`, { parse_mode: 'Markdown' });
+                if (ctx) ctx.reply(`🔢 **رمزك هو:**\n\`${code}\`\n\n⚠️ انسخه وضعه فوراً!`, { parse_mode: 'Markdown' });
             } catch (e) {
-                if (ctx) ctx.reply('❌ فشل طلب الرمز. حاول مجدداً.');
+                if (ctx) ctx.reply('❌ فشل الطلب. انتظر دقيقة وحاول مجدداً.');
             }
-        }, 5000);
+        }, 3000);
     }
 
     sock.ev.on('connection.update', async (update) => {
@@ -70,8 +86,17 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            // إعادة المحاولة فقط إذا لم يتم الطرد
-            if (statusCode !== DisconnectReason.loggedOut) {
+            // 401 = تم تسجيل الخروج أو الرمز خطأ
+            if (statusCode === 401 || statusCode === 403) {
+                 delete sessions[userId];
+                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+                 if (ctx) ctx.reply('⚠️ الرمز انتهى أو كان خاطئاً. حاول مجدداً.');
+            }
+            // 515 = إعادة تشغيل عادية (لا نرسل رسالة)
+            else if (statusCode === 515) {
+                startBaileysSession(userId, null);
+            }
+            else if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
             } else {
                 delete sessions[userId];
@@ -81,12 +106,13 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         } 
         else if (connection === 'open') {
             console.log(`✅ ${userId} Connected!`);
-            if (ctx) ctx.reply('✅ **تم الربط بنجاح!** 🥳\nالبوت جاهز.', Markup.inlineKeyboard([[Markup.button.callback('القائمة', 'main_menu')]]));
+            if (ctx) ctx.reply('✅ **تم الربط بنجاح!** 🥳\nمبروك عليك.', Markup.inlineKeyboard([[Markup.button.callback('القائمة', 'main_menu')]]));
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // استقبال الرسائل
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -99,16 +125,16 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
     });
 }
 
-// UI
+// 4. UI
 bot.start((ctx) => {
-    ctx.reply('👋 أهلاً بك. تأكد من أرشفة محادثاتك لضمان الربط السريع.', Markup.inlineKeyboard([
+    ctx.reply('👋 أهلاً بك. \n⚠️ هام: استخدم بيانات الهاتف (4G) وليس الواي فاي للربط.', Markup.inlineKeyboard([
         [Markup.button.callback('📱 ربط برقم الهاتف', 'login_phone')],
         [Markup.button.callback('🗑️ تصفير', 'logout')]
     ]));
 });
 
 bot.action('login_phone', (ctx) => {
-    ctx.reply('📞 أرسل رقمك الآن:');
+    ctx.reply('📞 هات الرقم:');
     sessions[ctx.from.id] = { step: 'WAIT_PHONE' };
 });
 
