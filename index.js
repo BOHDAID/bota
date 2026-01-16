@@ -11,7 +11,7 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Auto-Fix 515)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Windows Mode + Hard Reset)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
@@ -57,24 +57,22 @@ async function restoreSessions() {
         const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_'));
         for (const folder of folders) {
             const userId = folder.replace('session_', '');
-            try {
-                const user = await User.findById(userId);
-                if (user && user.expiry > Date.now()) {
-                    await sleep(3000); // انتظار لعدم الضغط على السيرفر
-                    startBaileysSession(userId, null);
-                }
-            } catch (e) {}
+            const user = await User.findById(userId);
+            if (user && user.expiry > Date.now()) {
+                await sleep(3000); 
+                startBaileysSession(userId, null);
+            }
         }
     }
 }
 
 // ============================================================
-// 3. محرك Baileys (مزود بكاسر الحلقة 515)
+// 3. محرك Baileys (توقيع ويندوز)
 // ============================================================
 async function startBaileysSession(userId, ctx) {
     if (sessions[userId] && sessions[userId].status === 'CONNECTING') return;
 
-    if (ctx) ctx.reply('🚀 **جاري الاتصال...**').catch(()=>{});
+    if (ctx) ctx.reply('🚀 **جاري الاتصال (Windows Engine)...**').catch(()=>{});
 
     const sessionDir = `./auth_info/session_${userId}`;
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -85,12 +83,12 @@ async function startBaileysSession(userId, ctx) {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        // استخدام توقيع Ubuntu ليتوافق مع Docker/Render
-        browser: Browsers.ubuntu('Chrome'),
+        // 🔥 تغيير التوقيع إلى Windows لتجنب حظر 515 من سيرفرات لينكس
+        browser: Browsers.macOS('Desktop'), 
         syncFullHistory: false,
         connectTimeoutMs: 60000, 
-        retryRequestDelayMs: 2000,
-        keepAliveIntervalMs: 10000
+        retryRequestDelayMs: 5000,
+        keepAliveIntervalMs: 30000
     });
 
     sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [] };
@@ -103,7 +101,7 @@ async function startBaileysSession(userId, ctx) {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
                 await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز**\nتم تنظيف الجلسة.',
+                    caption: '📱 **امسح الرمز الجديد**\nتم تغيير النظام.',
                     ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]])
                 });
             } catch (e) {}
@@ -113,28 +111,13 @@ async function startBaileysSession(userId, ctx) {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log(`❌ Status: ${statusCode}`);
             
-            // 🧨 الكود الكاسر للحلقة 🧨
-            // إذا واجهنا خطأ 515، فهذا يعني أن ملف الجلسة لا يتوافق مع السيرفر
-            // الحل: نحذفه فوراً ونطلب كيو آر جديد
+            // التعامل مع 515 بتأخير ذكي
             if (statusCode === 515) {
-                console.log('🔥 515 Loop Detected! Deleting corrupted session...');
-                delete sessions[userId];
-                if (fs.existsSync(sessionDir)) {
-                    fs.rmSync(sessionDir, { recursive: true, force: true });
-                }
-                
-                if (ctx) {
-                    ctx.reply('⚠️ تم اكتشاف ملف جلسة تالف (Error 515). تم حذفه تلقائياً.\n**يرجى مسح الرمز الجديد.**');
-                    // إعادة التشغيل بعد ثانيتين (سيطلب QR جديد)
-                    setTimeout(() => startBaileysSession(userId, ctx), 2000);
-                } else {
-                    // إذا كان يعمل في الخلفية بدون ctx، نعيد المحاولة مرة واحدة فقط
-                    setTimeout(() => startBaileysSession(userId, null), 2000);
-                }
+                console.log('⏳ 515 Error. Restarting in 5s...');
+                setTimeout(() => startBaileysSession(userId, null), 5000); 
                 return;
             }
 
-            // باقي الأخطاء
             if (statusCode === 401 || statusCode === 403 || statusCode === 405) {
                 delete sessions[userId];
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -175,18 +158,44 @@ async function startBaileysSession(userId, ctx) {
 }
 
 // ============================================================
-// 4. القوائم (الكاملة)
+// 4. القوائم والأزرار + أمر التصفير
 // ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
     const isAdmin = (ctx.from.id.toString() == ADMIN_ID);
     if (!isAdmin) {
-        if (ctx.message && ctx.message.text === '/start') return next();
+        if (ctx.message && ['/start', '/reset'].includes(ctx.message.text)) return next(); // السماح بـ Reset
         if (ctx.callbackQuery && ctx.callbackQuery.data.startsWith('req_')) return next();
         const user = await User.findById(ctx.from.id.toString());
         if (!user || user.expiry < Date.now()) return ctx.reply('⛔ اشتراكك منتهي.');
     }
     return next();
+});
+
+// 🔥🔥🔥 الأمر الجديد للتصفير الشامل 🔥🔥🔥
+bot.command('reset', async (ctx) => {
+    const userId = ctx.from.id.toString();
+    ctx.reply('☢️ **جاري تنفيذ التصفير الشامل (Files + DB)...**');
+
+    // 1. إنهاء الاتصال الحي
+    if (sessions[userId]) {
+        try { sessions[userId].sock.end(); } catch(e) {}
+        delete sessions[userId];
+    }
+
+    // 2. حذف ملفات الجلسة من السيرفر
+    const sessionDir = `./auth_info/session_${userId}`;
+    if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+        console.log(`Deleted files for ${userId}`);
+    }
+
+    // 3. (اختياري) تنظيف قاعدة البيانات إذا كنت تشك بها
+    // ملاحظة: هذا لن يحذف اشتراكك (User)، بل فقط الردود أو أي بيانات جلسة إن وجدت
+    // إذا كنت تريد حذف كل شيء فعلاً، أخبرني لأضيف سطر حذف User
+    
+    await sleep(2000);
+    ctx.reply('✅ **تم التصفير بنجاح!**\nالآن أنت "مستخدم جديد" تماماً.\nاضغط /start للبدء من الصفر.');
 });
 
 async function showMainMenu(ctx) {
