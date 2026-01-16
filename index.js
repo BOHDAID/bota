@@ -1,19 +1,17 @@
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
+const pino = require('pino');
 const fs = require('fs');
-const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
-const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const mongoose = require('mongoose');
 const express = require('express');
-const axios = require('axios');
-const { execSync } = require('child_process');
 
 // ============================================================
 // 1. سيرفر Render (Keep-Alive)
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (No-Sync Mode)'));
+app.get('/', (req, res) => res.send('✅ Baileys Bot is Running (Lightweight)!'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
@@ -31,341 +29,184 @@ mongoose.connect(MONGO_URI)
     .catch(err => console.error('❌ MongoDB Error:', err));
 
 const userSchema = new mongoose.Schema({ _id: String, expiry: Number });
-const settingSchema = new mongoose.Schema({ key: String, value: String });
 const replySchema = new mongoose.Schema({ userId: String, keyword: String, response: String });
 const historySchema = new mongoose.Schema({ _id: String, date: Number });
 
 const User = mongoose.model('User', userSchema);
-const Setting = mongoose.model('Setting', settingSchema);
 const Reply = mongoose.model('Reply', replySchema);
 const History = mongoose.model('History', historySchema);
 
-// ⚠️ تغيير هام: لن نخزن الجروبات في هذا المتغير لتوفير الرام
-// سنخزن فقط كائن العميل (Client) والبيانات الأساسية
+// متغيرات الذاكرة
 const sessions = {}; 
 const userStates = {}; 
-let ADMIN_USERNAME_CACHE = '';
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 bot.catch((err) => console.log('Telegraf Error:', err));
 
-async function fetchAdmin() {
-    if (!ADMIN_ID) return;
-    try {
-        const chat = await bot.telegram.getChat(ADMIN_ID);
-        if(chat.username) {
-            ADMIN_USERNAME_CACHE = chat.username;
-            await Setting.findOneAndUpdate({ key: 'admin_user' }, { value: chat.username }, { upsert: true });
-        }
-    } catch (e) {}
-}
-fetchAdmin();
-
+// استعادة الجلسات
 async function restoreSessions() {
-    console.log('🔄 Checking saved sessions...');
-    const authPath = path.join(__dirname, '.wwebjs_auth');
+    const authPath = './auth_info';
     if (fs.existsSync(authPath)) {
-        const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_user_'));
+        const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_'));
         for (const folder of folders) {
-            const userId = folder.replace('session_user_', '');
+            const userId = folder.replace('session_', '');
             try {
                 const user = await User.findById(userId);
                 if (user && user.expiry > Date.now()) {
-                    await startUserSession(userId, null); 
-                    await sleep(10000); 
+                    startBaileysSession(userId, null);
                 }
             } catch (e) {}
         }
     }
 }
 
-function getChromeExecutablePath() {
-    try {
-        const cacheDir = path.join(__dirname, '.cache', 'chrome');
-        if (fs.existsSync(cacheDir)) {
-            const command = `find ${cacheDir} -name chrome -type f -executable | head -n 1`;
-            const chromePath = execSync(command).toString().trim();
-            if (chromePath) return chromePath;
-        }
-    } catch (error) {}
-    return undefined;
-}
-
 // ============================================================
-// 3. محرك الواتساب (وضع عدم المزامنة)
+// 3. محرك Baileys (بديل المتصفح)
 // ============================================================
-async function startUserSession(userId, ctx) {
-    if (sessions[userId]) {
-        if (sessions[userId].status === 'READY') {
-            if (ctx) ctx.reply('✅ **متصل.**', Markup.inlineKeyboard([[Markup.button.callback('📂 الخدمات', 'services_menu')], [Markup.button.callback('❌ خروج', 'logout')]]));
-            return;
-        }
-        if (sessions[userId].status === 'QR_SENT') return;
-    }
+async function startBaileysSession(userId, ctx) {
+    if (sessions[userId]) return;
 
-    if (ctx) ctx.editMessageText('🚀 **جاري التشغيل (بدون مزامنة)...**').catch(()=>{});
+    if (ctx) ctx.reply('🚀 **جاري إنشاء الاتصال المباشر...**');
 
-    const chromePath = getChromeExecutablePath();
+    // إعداد مجلد المصادقة
+    const { state, saveCreds } = await useMultiFileAuthState(`./auth_info/session_${userId}`);
 
-    const client = new Client({
-        authStrategy: new LocalAuth({ 
-            clientId: `user_${userId}`,
-            dataPath: path.join(__dirname, '.wwebjs_auth')
-        }),
-        puppeteer: { 
-            headless: true,
-            executablePath: chromePath,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--no-first-run',
-                '--no-zygote',
-                '--single-process', 
-                '--disable-gpu',
-                '--disable-extensions',
-                '--mute-audio'
-            ] 
-        },
-        // 🛑 إعدادات منع المزامنة واستهلاك الرام 🛑
-        qrMaxRetries: 5,
-        authTimeoutMs: 0, // انتظار لانهائي لتجنب الفصل
-        // هذه الخيارات تمنع تحميل المحادثات القديمة للرام
-        loadingScreen: false,
+    const sock = makeWASocket({
+        logger: pino({ level: 'silent' }),
+        printQRInTerminal: false,
+        auth: state,
+        browser: Browsers.macOS('Desktop'), // الظهور كمتصفح عادي
+        syncFullHistory: false // ⛔ منع تحميل الرسائل القديمة (توفير الرام)
     });
 
-    // ⚠️ ملاحظة: هنا لا نقوم بتعريف مصفوفة groups في الذاكرة لتوفير المساحة
-    sessions[userId] = { client: client, selected: [], publishing: false, status: 'INITIALIZING' };
+    sessions[userId] = { sock, status: 'CONNECTING' };
 
-    client.on('qr', async (qr) => {
-        if (sessions[userId].status === 'QR_SENT') return;
-        sessions[userId].status = 'QR_SENT';
+    // إدارة أحداث الاتصال
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-        if(ctx) {
+        if (qr && ctx) {
+            // إرسال كيو آر للتليجرام
             try {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
-                await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز**\n⚡ النظام الآن خفيف جداً.\nلن تتم مزامنة الرسائل القديمة.',
-                    ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث الرمز', 'retry_login')]])
-                });
+                await ctx.replyWithPhoto({ source: buffer }, { caption: '📱 **امسح الرمز (Baileys)**\nسريع وخفيف جداً.' });
             } catch (e) {}
         }
-    });
 
-    client.on('ready', () => {
-        sessions[userId].status = 'READY';
-        console.log(`✅ User ${userId} Ready (No Sync)!`);
-        if(ctx) bot.telegram.sendMessage(userId, '🎉 **تم الاتصال!**\nلم يتم تحميل الرسائل القديمة لتوفير الذاكرة.\nالبوت جاهز للعمل.').catch(()=>{});
-    });
-
-    // 🛑 معالجة الرسائل بذكاء (توفير الرام)
-    client.on('message', async (msg) => {
-        // 1. تجاهل رسائل البوت نفسه أو رسائل الحالة
-        if (msg.fromMe || msg.isStatus) return;
-
-        try {
-            // 2. فحص سريع في قاعدة البيانات (MongoDB) بدلاً من الرام
-            // هل لدينا رد مسجل لهذه الكلمة؟
-            const replyConfig = await Reply.findOne({ 
-                userId: userId, 
-                // استخدام Regex للبحث المرن (اختياري) أو تطابق تام
-                keyword: { $regex: new RegExp(`^${msg.body}$`, 'i') } 
-            });
-
-            // 3. إذا وجدنا رداً في القاعدة، نرسله
-            if (replyConfig) {
-                console.log(`🤖 Auto-reply triggered for user ${userId}`);
-                await msg.reply(replyConfig.response);
-            }
+        if (connection === 'close') {
+            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            console.log(`Connection closed due to ${lastDisconnect.error}, reconnecting: ${shouldReconnect}`);
             
-            // 4. إذا لم نجد رداً، لا نفعل شيئاً ولا نخزن الرسالة في الرام
-            // الرسالة ستمر مرور الكرام ويتم تنظيفها تلقائياً من ذاكرة كروم
-
-        } catch (e) {
-            console.error('Auto-reply check error:', e.message);
+            delete sessions[userId];
+            
+            if (shouldReconnect) {
+                startBaileysSession(userId, null); // إعادة اتصال تلقائي
+            } else {
+                if (ctx) ctx.reply('❌ تم تسجيل الخروج.');
+                // حذف ملفات الجلسة
+                fs.rmSync(`./auth_info/session_${userId}`, { recursive: true, force: true });
+            }
+        } else if (connection === 'open') {
+            console.log('✅ Opened connection');
+            sessions[userId].status = 'READY';
+            if (ctx) ctx.reply('✅ **تم الاتصال بنجاح!**');
         }
     });
 
-    client.on('disconnected', (reason) => { 
-        if (sessions[userId]) sessions[userId].status = 'DISCONNECTED'; 
-        cleanupSession(userId);
+    // حفظ الاعتمادات
+    sock.ev.on('creds.update', saveCreds);
+
+    // استقبال الرسائل (للرد التلقائي)
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+        const msg = messages[0];
+        if (!msg.message || msg.key.fromMe) return;
+
+        const remoteJid = msg.key.remoteJid;
+        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+
+        if (!textMessage) return;
+
+        try {
+            // البحث عن رد في القاعدة
+            const reply = await Reply.findOne({ userId: userId, keyword: textMessage });
+            if (reply) {
+                await sock.sendMessage(remoteJid, { text: reply.response });
+            }
+        } catch (e) {
+            console.log('Reply error', e);
+        }
     });
-
-    try { 
-        await client.initialize(); 
-    } catch (error) { 
-        console.error(`❌ Error (${userId}):`, error.message);
-        if(ctx) ctx.reply('⚠️ حدث خطأ، اضغط تحديث.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
-        await cleanupSession(userId);
-    }
-}
-
-bot.action('retry_login', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    ctx.editMessageText('🧹 **إعادة تعيين...**').catch(()=>{});
-    await cleanupSession(userId);
-    await sleep(2000);
-    await startUserSession(userId, ctx); 
-});
-
-bot.action('logout', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    ctx.editMessageText('⏳ **خروج...**').catch(()=>{});
-    await cleanupSession(userId);
-    ctx.reply('✅ **تم.**', Markup.inlineKeyboard([[Markup.button.callback('🔙 القائمة', 'main_menu')]]));
-});
-
-async function cleanupSession(userId) {
-    if (sessions[userId]) { try { await sessions[userId].client.destroy(); } catch (e) {} delete sessions[userId]; }
-    const sessionDir = path.join(__dirname, '.wwebjs_auth', `session_user_${userId}`);
-    if (fs.existsSync(sessionDir)) { try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {} }
 }
 
 // ============================================================
-// 4. القوائم والتحكم
+// 4. أزرار وأوامر التيليجرام
 // ============================================================
-// (نفس الكود السابق للميدل وير والقائمة الرئيسية، لا تغيير)
-bot.use(async (ctx, next) => {
-    if (!ctx.from) return next();
+
+bot.start((ctx) => {
+    ctx.reply('👋 مرحباً بك في بوت واتساب الخفيف (Baileys).\nاضغط أدناه للبدء.', 
+        Markup.inlineKeyboard([[Markup.button.callback('🔗 ربط واتساب', 'connect_wa')]]));
+});
+
+bot.action('connect_wa', (ctx) => {
     const userId = ctx.from.id.toString();
-    try { await History.create({ _id: userId, date: Date.now() }); } catch(e) {} 
-    const isAdmin = (userId == ADMIN_ID);
-    if (!isAdmin) {
-        // التحقق من القناة والاشتراك (تم اختصار الكود هنا لعدم التكرار، استخدم نفس المنطق السابق)
-        // ... (نفس كود التحقق)
-    }
-    return next();
+    startBaileysSession(userId, ctx);
 });
 
-// ... (دوال القوائم showMainMenu, showServicesMenu نفس السابق) ...
-async function showMainMenu(ctx) {
-    // ... (نفس الكود السابق) ...
-    // فقط لتوضيح السياق، هنا يتم عرض الأزرار
-    const buttons = [
-        [Markup.button.callback('🔗 واتساب / الحالة', 'open_dashboard')],
-        [Markup.button.callback('📂 الخدمات', 'services_menu')],
-        [Markup.button.callback('⏳ اشتراكي', 'check_my_sub')]
-    ];
-    if (ctx.from.id.toString() == ADMIN_ID) buttons.push([Markup.button.callback('🛠️ لوحة المدير', 'admin_panel')]);
-    
-    await ctx.reply('👋 مرحباً بك في لوحة التحكم', Markup.inlineKeyboard(buttons));
-}
-// ... (باقي أكواد القوائم) ...
-
-bot.action('main_menu', (ctx) => showMainMenu(ctx));
-bot.action('services_menu', async (ctx) => {
-    const kb = Markup.inlineKeyboard([
-        [Markup.button.callback('📨 نشر', 'broadcast'), Markup.button.callback('⚙️ جلب الجروبات', 'fetch_groups')], // تم تغيير الاسم
-        [Markup.button.callback('🤖 ردود', 'my_replies'), Markup.button.callback('🔙 القائمة', 'main_menu')]
-    ]);
-    ctx.editMessageText('📂 **الخدمات:**', kb).catch(()=>{});
-});
-bot.action('open_dashboard', (ctx) => startUserSession(ctx.from.id.toString(), ctx));
-
-
-// ============================================================
-// 5. جلب الجروبات (عند الطلب فقط) - Lazy Fetch
-// ============================================================
-bot.action('fetch_groups', async (ctx) => {
+// خدمة جلب الجروبات
+bot.command('groups', async (ctx) => {
     const userId = ctx.from.id.toString();
     const s = sessions[userId];
-    if(!s?.client?.info) return ctx.reply('⚠️ اربط الواتساب أولاً.');
+    if (!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
 
-    await ctx.answerCbQuery('⏳ جاري الاتصال بالواتساب وسحب الجروبات...');
-    
     try {
-        // 1. هنا فقط نقوم بطلب الشاتات من الواتساب
-        const chats = await s.client.getChats();
-        
-        // 2. تصفية الجروبات
-        const groups = chats.filter(c => c.isGroup && !c.isReadOnly);
-        
-        // 3. لا نحفظ الكائن الكامل في الذاكرة، نرسل القائمة للمستخدم ثم نحذف البيانات الثقيلة
-        // سنحفظ فقط الـ IDs مؤقتاً لعملية الاختيار الحالية، وليس بشكل دائم
-        s.tempGroups = groups.map(g => ({ id: g.id._serialized, name: g.name }));
-
-        sendGroupMenu(ctx, userId);
-        
-        // تنظيف الذاكرة: المتغير chats سيتم حذفه تلقائياً عند انتهاء الدالة
-        
+        const groups = await s.sock.groupFetchAllParticipating();
+        const groupList = Object.values(groups).map(g => `▫️ ${g.subject}`).join('\n');
+        ctx.reply(`📂 **الجروبات:**\n\n${groupList.substring(0, 4000)}`);
     } catch (e) {
-        console.error('Fetch error:', e);
-        ctx.reply('❌ فشل جلب الجروبات. السيرفر مشغول.');
+        ctx.reply('خطأ في جلب الجروبات.');
     }
 });
 
-async function sendGroupMenu(ctx, userId) {
-    const s = sessions[userId];
-    if (!s.tempGroups) return;
-
-    // عرض أول 20 جروب فقط لتوفير الذاكرة وتجنب حدود تليجرام
-    const btns = s.tempGroups.slice(0, 20).map(g => {
-        const isSelected = s.selected.includes(g.id);
-        return [Markup.button.callback(`${isSelected ? '✅' : '⬜'} ${g.name.substring(0,15)}`, `sel_${g.id}`)];
-    });
-    
-    btns.push([Markup.button.callback('✅ الكل', 'sel_all'), Markup.button.callback('❌ إلغاء', 'desel_all')]);
-    btns.push([Markup.button.callback(`💾 حفظ (${s.selected.length})`, 'done_sel')]);
-    
-    const msg = '📂 **اختر الجروبات للنشر:**\n(يتم عرض جزء من الجروبات لتخفيف الحمل)';
-    try { await ctx.editMessageText(msg, Markup.inlineKeyboard(btns)); } 
-    catch { ctx.reply(msg, Markup.inlineKeyboard(btns)); }
-}
-
-bot.action(/sel_(.+)/, (ctx) => {
-    const s = sessions[ctx.from.id.toString()];
-    const id = ctx.match[1];
-    s.selected.includes(id) ? s.selected = s.selected.filter(i=>i!==id) : s.selected.push(id);
-    sendGroupMenu(ctx, ctx.from.id.toString());
-});
-
-bot.action('sel_all', (ctx) => { 
-    const s = sessions[ctx.from.id.toString()];
-    if(s.tempGroups) s.selected = s.tempGroups.map(g => g.id); 
-    sendGroupMenu(ctx, ctx.from.id.toString()); 
-});
-
-bot.action('desel_all', (ctx) => { 
-    sessions[ctx.from.id.toString()].selected = []; 
-    sendGroupMenu(ctx, ctx.from.id.toString()); 
-});
-
-bot.action('done_sel', (ctx) => { 
-    const s = sessions[ctx.from.id.toString()];
-    ctx.answerCbQuery('✅ تم حفظ القائمة'); 
-    
-    // ⚠️ تنظيف مهم جداً للذاكرة:
-    // بعد الانتهاء من الاختيار، نحذف قائمة الجروبات من الذاكرة
-    delete s.tempGroups; 
-    
-    // العودة للقائمة
-    const kb = Markup.inlineKeyboard([
-        [Markup.button.callback('📨 بدء النشر', 'broadcast')],
-        [Markup.button.callback('🔙 القائمة', 'services_menu')]
-    ]);
-    ctx.editMessageText(`✅ تم تحديد ${s.selected.length} جروب.\nجاهز للنشر.`, kb).catch(()=>{});
-});
-
-// ... (باقي أكواد النشر broadcast والردود my_replies والادمن نفس السابق) ...
-// (قم بنسخها من الكود السابق لإكمال الملف)
-
-// (اختصاراً للمساحة، سأضع لك أهم جزء متبقي وهو النشر)
-bot.action('broadcast', (ctx) => {
+// خدمة النشر (Broadcast)
+bot.command('cast', async (ctx) => {
     const userId = ctx.from.id.toString();
-    if (!sessions[userId]?.selected.length) return ctx.reply('⚠️ لم تختر جروبات بعد.');
-    userStates[userId] = { step: 'WAIT_CONTENT' };
-    ctx.reply('📝 أرسل المحتوى (نص/صورة/فيديو):');
+    const s = sessions[userId];
+    if (!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
+
+    // مثال بسيط للنشر: يطلب النص ثم يرسل لكل الجروبات
+    // (يمكن تطويره ليكون بأزرار مثل الكود السابق)
+    const text = ctx.message.text.replace('/cast ', '');
+    if (!text || text === '/cast') return ctx.reply('أكتب الرسالة بعد الأمر.\nمثال: /cast مرحبا');
+
+    ctx.reply('⏳ جاري النشر...');
+    const groups = await s.sock.groupFetchAllParticipating();
+    const groupIds = Object.keys(groups);
+
+    let count = 0;
+    for (const id of groupIds) {
+        try {
+            await s.sock.sendMessage(id, { text: text });
+            count++;
+            await new Promise(r => setTimeout(r, 1000)); // انتظار ثانية
+        } catch (e) {}
+    }
+    ctx.reply(`✅ تم النشر في ${count} جروب.`);
 });
 
-bot.on(['text', 'photo', 'video'], async (ctx) => {
-    // ... (نفس منطق المعالجة السابق تماماً) ...
-    // فقط تأكد في دالة النشر أنك تستخدم s.client.sendMessage مباشرة
-    // دون الاعتماد على أي بيانات مخزنة في الرام غير الـ IDs الموجودة في s.selected
+// إضافة رد تلقائي
+bot.command('addreply', async (ctx) => {
+    // تنسيق: /addreply كلمة | رد
+    const args = ctx.message.text.split('|');
+    if (args.length < 2) return ctx.reply('خطأ. التنسيق:\n/addreply كلمة | الرد');
+    
+    const keyword = args[0].replace('/addreply ', '').trim();
+    const response = args[1].trim();
+    const userId = ctx.from.id.toString();
+
+    await Reply.create({ userId, keyword, response });
+    ctx.reply('✅ تم حفظ الرد.');
 });
 
-// تشغيل البوت
 bot.launch();
 process.once('SIGINT', () => bot.stop());
