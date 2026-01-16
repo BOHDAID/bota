@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, Browsers, fetchLatestBaileysVersion, delay, initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, delay, initAuthCreds, BufferJSON, proto, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
@@ -9,7 +9,7 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Anti-Bad-MAC System)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Pagination + Forced Sub Fixed)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
@@ -40,7 +40,7 @@ const msgRetryCounterCache = new Map();
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
 // ============================================================
-// 3. محول قاعدة البيانات (MongoDB Auth Adapter)
+// 3. نظام حفظ الجلسة في MongoDB (لمنع الخروج)
 // ============================================================
 const useMongoDBAuthState = async (sessionId) => {
     const writeData = async (data, key) => {
@@ -120,13 +120,12 @@ async function restoreSessions() {
 }
 
 // ============================================================
-// 4. محرك Baileys (مع حماية Bad MAC)
+// 4. محرك Baileys
 // ============================================================
 async function startBaileysSession(userId, ctx, phoneNumber = null) {
     if (sessions[userId] && sessions[userId].status === 'READY' && !phoneNumber) return;
 
     if (phoneNumber) {
-        // تنظيف كامل عند طلب ربط جديد
         await SessionModel.deleteMany({ _id: { $regex: `^${userId}-` } });
     }
 
@@ -148,7 +147,7 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         getMessage: async (key) => { return { conversation: 'hello' }; }
     });
 
-    sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [] };
+    sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [], page: 0 };
 
     if (phoneNumber && !sock.authState.creds.registered) {
         setTimeout(async () => {
@@ -167,35 +166,12 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         const { connection, lastDisconnect } = update;
 
         if (connection === 'close') {
-            const error = lastDisconnect?.error;
-            const statusCode = error?.output?.statusCode;
-            const errorMsg = error?.message || '';
-
-            console.log(`❌ Closed: ${statusCode} - ${errorMsg}`);
-
-            // 🔥🔥🔥 كاشف الأخطاء القاتلة (Bad MAC) 🔥🔥🔥
-            // إذا اكتشفنا أن المفاتيح تالفة، نحذف الجلسة فوراً
-            const isCorrupted = 
-                errorMsg.includes('Bad MAC') || 
-                errorMsg.includes('PreKey') || 
-                errorMsg.includes('Signal') ||
-                statusCode === 401 || 
-                statusCode === 403 ||
-                statusCode === 405;
-
-            if (isCorrupted) {
-                 console.log(`☢️ Session CORRUPTED (${userId}). Wiping data...`);
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            if (statusCode === 401 || statusCode === 403) {
                  delete sessions[userId];
-                 // حذف كل بيانات الجلسة من قاعدة البيانات
                  await SessionModel.deleteMany({ _id: { $regex: `^${userId}-` } });
-                 
-                 const msg = '⚠️ **تنبيه:** تم اكتشاف خلل في التشفير (Bad MAC).\nتم حذف الجلسة تلقائياً.\nيرجى إعادة الربط.';
-                 if (ctx) ctx.reply(msg);
-                 else bot.telegram.sendMessage(userId, msg).catch(()=>{});
-                 return; // لا نعد الاتصال، ننتظر ربطاً جديداً
-            }
-            
-            if (statusCode !== DisconnectReason.loggedOut) {
+                 if (ctx) ctx.reply('⚠️ انتهت الجلسة.');
+            } else if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
             } else {
                 delete sessions[userId];
@@ -206,13 +182,16 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         else if (connection === 'open') {
             console.log(`✅ ${userId} Connected!`);
             sessions[userId].status = 'READY';
+            
+            const successMsg = '✅ **تم الاتصال بنجاح!**';
             const kb = Markup.inlineKeyboard([
                 [Markup.button.callback('📨 نشر للكل', 'broadcast'), Markup.button.callback('⚙️ الجروبات', 'fetch_groups')],
                 [Markup.button.callback('🤖 الردود', 'my_replies'), Markup.button.callback('❌ خروج', 'logout')],
                 [Markup.button.callback('🔙 القائمة', 'main_menu')]
             ]);
-            if (ctx) ctx.reply('✅ **تم الاتصال بنجاح!**', kb);
-            else bot.telegram.sendMessage(userId, '✅ **البوت متصل ويعمل.**', kb).catch(()=>{});
+            
+            if (ctx) ctx.reply(successMsg, kb);
+            else bot.telegram.sendMessage(userId, successMsg, kb).catch(()=>{});
         }
     });
 
@@ -231,7 +210,7 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
 }
 
 // ============================================================
-// 5. باقي الكود (Middleware والقوائم)
+// 5. Middleware (نظام الاشتراك الإجباري الصارم)
 // ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
@@ -239,15 +218,66 @@ bot.use(async (ctx, next) => {
     try { await History.create({ _id: userId, date: Date.now() }); } catch(e) {} 
     const isAdmin = (userId == ADMIN_ID);
 
+    // التحقق من زر "تم الاشتراك"
+    if (ctx.callbackQuery && ctx.callbackQuery.data === 'check_sub') {
+        try {
+            const setting = await Setting.findOne({ key: 'force_channel' });
+            if (setting && setting.value) {
+                // إضافة @ إذا لم تكن موجودة
+                let channelUser = setting.value.startsWith('@') ? setting.value : `@${setting.value}`;
+                const member = await ctx.telegram.getChatMember(channelUser, userId);
+                if (['creator', 'administrator', 'member'].includes(member.status)) {
+                    await ctx.deleteMessage();
+                    await ctx.reply('✅ شكراً لاشتراكك!');
+                    return showMainMenu(ctx);
+                } else {
+                    return ctx.answerCbQuery('❌ لم تشترك بعد!', { show_alert: true });
+                }
+            }
+        } catch (e) {
+            return ctx.answerCbQuery('⚠️ تأكد أن البوت مشرف في القناة!', { show_alert: true });
+        }
+    }
+
     if (!isAdmin) {
+        // فحص القناة الإجبارية قبل أي شيء
+        try {
+            const setting = await Setting.findOne({ key: 'force_channel' });
+            if (setting && setting.value) {
+                let channelUser = setting.value.startsWith('@') ? setting.value : `@${setting.value}`;
+                try {
+                    const member = await ctx.telegram.getChatMember(channelUser, userId);
+                    // إذا غادر أو طُرد أو لم يشترك
+                    if (['left', 'kicked'].includes(member.status)) {
+                        throw new Error('Not Subscribed');
+                    }
+                } catch (err) {
+                    // إذا حدث خطأ (يعني غالباً لم يشترك أو البوت ليس مشرفاً)
+                    return ctx.reply(
+                        `⛔ **عذراً، يجب عليك الاشتراك في القناة أولاً لاستخدام البوت.**\n\nالقناة: ${channelUser}`,
+                        Markup.inlineKeyboard([
+                            [Markup.button.url('اشتراك في القناة', `https://t.me/${channelUser.replace('@', '')}`)],
+                            [Markup.button.callback('✅ تم الاشتراك', 'check_sub')]
+                        ])
+                    );
+                }
+            }
+        } catch (e) { console.log(e); }
+
+        // فحص اشتراك البوت المدفوع
         if (ctx.message && ['/start', '/reset'].includes(ctx.message.text)) return next();
         if (ctx.callbackQuery && ['login_check', 'logout'].includes(ctx.callbackQuery.data)) return next();
+        
         const user = await User.findById(userId);
-        if (!user || user.expiry < Date.now()) return ctx.reply('⛔ اشتراكك منتهي.');
+        if (!user || user.expiry < Date.now()) return ctx.reply('⛔ **اشتراكك في البوت منتهي.**\nتواصل مع المدير للتجديد.');
     }
+    
     return next();
 });
 
+// ============================================================
+// 6. القوائم والواجهة
+// ============================================================
 async function showMainMenu(ctx) {
     const userId = ctx.from.id.toString();
     const isAdmin = (userId == ADMIN_ID);
@@ -255,13 +285,13 @@ async function showMainMenu(ctx) {
     const isPaid = (user && user.expiry > Date.now());
     const isConnected = sessions[userId] && sessions[userId].status === 'READY';
 
-    let msg = `👋 **مرحباً بك**\n`;
+    let msg = `👋 **مرحباً بك في لوحة التحكم**\n`;
     let buttons = [];
 
     if (isAdmin || isPaid) {
         msg += `حالة الاتصال: ${isConnected ? '✅ متصل' : '❌ غير متصل'}\n`;
         if (isConnected) {
-            buttons.push([Markup.button.callback('🚀 الخدمات', 'services_menu')]);
+            buttons.push([Markup.button.callback('🚀 الخدمات (نشر/ردود)', 'services_menu')]);
             buttons.push([Markup.button.callback('❌ تسجيل خروج', 'logout')]);
         } else {
             buttons.push([Markup.button.callback('🔗 ربط واتساب', 'login_check')]);
@@ -296,6 +326,7 @@ bot.action('logout', async (ctx) => {
     ctx.editMessageText('✅ تم الخروج وحذف البيانات.');
 });
 
+// الخدمات
 bot.action('services_menu', (ctx) => {
     const userId = ctx.from.id.toString();
     if (!sessions[userId] || sessions[userId].status !== 'READY') return ctx.reply('⚠️ لست متصلاً!');
@@ -305,24 +336,73 @@ bot.action('services_menu', (ctx) => {
     ]));
 });
 
+// 🔥🔥🔥 نظام الجروبات الجديد (مع الصفحات) 🔥🔥🔥
 bot.action('fetch_groups', async (ctx) => {
-    const s = sessions[ctx.from.id.toString()];
+    const userId = ctx.from.id.toString();
+    const s = sessions[userId];
     if(!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
+    
     await ctx.answerCbQuery('جاري التحميل...');
     try {
         const groups = await s.sock.groupFetchAllParticipating();
-        s.allGroups = Object.values(groups).map(g => ({ id: g.id, name: g.subject }));
-        sendGroupMenu(ctx, ctx.from.id.toString());
-    } catch { ctx.reply('❌ خطأ'); }
+        // جلب كل الجروبات مهما كان اسمها
+        s.allGroups = Object.values(groups).map(g => ({ id: g.id, name: g.subject || 'بدون اسم' }));
+        s.page = 0; // البدء من الصفحة الأولى
+        sendGroupMenu(ctx, userId);
+    } catch (e) { 
+        console.log(e);
+        ctx.reply('❌ خطأ في جلب الجروبات'); 
+    }
 });
 
 async function sendGroupMenu(ctx, userId) {
     const s = sessions[userId];
-    const btns = s.allGroups.slice(0, 20).map(g => [Markup.button.callback(`${s.selected.includes(g.id)?'✅':'⬜'} ${g.name.substring(0,10)}`, `sel_${g.id}`)]);
-    btns.push([Markup.button.callback('✅ الكل', 'sel_all'), Markup.button.callback('❌ إلغاء', 'desel_all')]);
-    btns.push([Markup.button.callback(`نشر (${s.selected.length})`, 'broadcast')]);
-    try { await ctx.editMessageText('الجروبات:', Markup.inlineKeyboard(btns)); } catch { ctx.reply('الجروبات:', Markup.inlineKeyboard(btns)); }
+    const page = s.page || 0;
+    const perPage = 10; // عدد الجروبات في الصفحة
+    const total = s.allGroups.length;
+    const maxPage = Math.ceil(total / perPage) - 1;
+
+    // تقسيم الجروبات للصفحة الحالية
+    const currentGroups = s.allGroups.slice(page * perPage, (page + 1) * perPage);
+
+    let btns = [];
+    currentGroups.forEach(g => {
+        // عرض اسم الجروب بشكل أفضل (أول 20 حرف)
+        const name = g.name.substring(0, 20);
+        const icon = s.selected.includes(g.id) ? '✅' : '⬜';
+        btns.push([Markup.button.callback(`${icon} ${name}`, `sel_${g.id}`)]);
+    });
+
+    // أزرار التنقل
+    let navBtns = [];
+    if (page > 0) navBtns.push(Markup.button.callback('⬅️ سابق', 'prev_page'));
+    if (page < maxPage) navBtns.push(Markup.button.callback('تالي ➡️', 'next_page'));
+    if (navBtns.length > 0) btns.push(navBtns);
+
+    btns.push([Markup.button.callback('✅ تحديد الكل (هذه الصفحة)', 'sel_page'), Markup.button.callback('❌ إلغاء', 'desel_all')]);
+    btns.push([Markup.button.callback(`📤 نشر (${s.selected.length})`, 'broadcast')]);
+    btns.push([Markup.button.callback('🔙 رجوع', 'services_menu')]);
+
+    try { await ctx.editMessageText(`📂 **الجروبات (صفحة ${page + 1}/${maxPage + 1}):**\nالإجمالي: ${total}`, Markup.inlineKeyboard(btns)); } 
+    catch { await ctx.reply(`📂 **الجروبات (صفحة ${page + 1}/${maxPage + 1}):**`, Markup.inlineKeyboard(btns)); }
 }
+
+bot.action('next_page', (ctx) => {
+    const s = sessions[ctx.from.id.toString()];
+    if (s) { s.page++; sendGroupMenu(ctx, ctx.from.id.toString()); }
+});
+bot.action('prev_page', (ctx) => {
+    const s = sessions[ctx.from.id.toString()];
+    if (s && s.page > 0) { s.page--; sendGroupMenu(ctx, ctx.from.id.toString()); }
+});
+bot.action('sel_page', (ctx) => {
+    const s = sessions[ctx.from.id.toString()];
+    const page = s.page || 0;
+    const perPage = 10;
+    const currentGroups = s.allGroups.slice(page * perPage, (page + 1) * perPage);
+    currentGroups.forEach(g => { if(!s.selected.includes(g.id)) s.selected.push(g.id); });
+    sendGroupMenu(ctx, ctx.from.id.toString());
+});
 
 bot.action(/sel_(.+)/, (ctx) => {
     const s = sessions[ctx.from.id.toString()];
@@ -330,7 +410,6 @@ bot.action(/sel_(.+)/, (ctx) => {
     s.selected.includes(id) ? s.selected = s.selected.filter(i=>i!==id) : s.selected.push(id);
     sendGroupMenu(ctx, ctx.from.id.toString());
 });
-bot.action('sel_all', (ctx) => { sessions[ctx.from.id.toString()].selected = sessions[ctx.from.id.toString()].allGroups.map(g => g.id); sendGroupMenu(ctx, ctx.from.id.toString()); });
 bot.action('desel_all', (ctx) => { sessions[ctx.from.id.toString()].selected = []; sendGroupMenu(ctx, ctx.from.id.toString()); });
 
 bot.action('broadcast', (ctx) => {
@@ -362,7 +441,7 @@ bot.action('admin_panel', (ctx) => ctx.editMessageText('🛠️ المدير:', 
 ])));
 bot.action('adm_add', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_SUB_ID' }; ctx.reply('الآيدي:'); });
 bot.action('adm_cast', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CAST' }; ctx.reply('الرسالة:'); });
-bot.action('adm_force', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CHAN' }; ctx.reply('اليوزر (أو off):'); });
+bot.action('adm_force', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CHAN' }; ctx.reply('اليوزر (مثل @MyChannel أو off):'); });
 
 // النصوص
 bot.on('text', async (ctx) => {
@@ -381,7 +460,7 @@ bot.on('text', async (ctx) => {
     if (userId == ADMIN_ID && state) {
         if (state.step === 'ADM_SUB_ID') { await User.findByIdAndUpdate(text, { expiry: Date.now() + 30*86400000 }, { upsert: true }); ctx.reply('✅'); userStates[userId]=null; return; }
         if (state.step === 'ADM_CAST') { const h = await History.find({}); h.forEach(u => ctx.copyMessage(u._id).catch(()=>{})); ctx.reply('✅'); userStates[userId]=null; return; }
-        if (state.step === 'ADM_CHAN') { await Setting.findOneAndUpdate({key:'force_channel'}, {value:text}, {upsert:true}); ctx.reply('✅'); userStates[userId]=null; return; }
+        if (state.step === 'ADM_CHAN') { await Setting.findOneAndUpdate({key:'force_channel'}, {value:text}, {upsert:true}); ctx.reply('✅ تم تعيين القناة.'); userStates[userId]=null; return; }
     }
 
     const s = sessions[userId];
