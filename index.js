@@ -11,7 +11,7 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Windows Mode + Hard Reset)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Anti-Timeout Mode)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
@@ -21,12 +21,7 @@ const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI)
-    .then(() => {
-        console.log('✅ MongoDB Connected!');
-        restoreSessions(); 
-    })
-    .catch(err => console.error('❌ MongoDB Error:', err));
+mongoose.connect(MONGO_URI).then(() => restoreSessions()).catch(e => console.log(e));
 
 const User = mongoose.model('User', new mongoose.Schema({ _id: String, expiry: Number }));
 const Setting = mongoose.model('Setting', new mongoose.Schema({ key: String, value: String }));
@@ -38,18 +33,7 @@ const userStates = {};
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-bot.catch((err) => console.log('⚠️ Telegraf Error:', err.message));
-
-async function fetchAdmin() {
-    if (!ADMIN_ID) return;
-    try {
-        const chat = await bot.telegram.getChat(ADMIN_ID);
-        if(chat.username) {
-            await Setting.findOneAndUpdate({ key: 'admin_user' }, { value: chat.username }, { upsert: true });
-        }
-    } catch (e) {}
-}
-fetchAdmin();
+bot.catch((err) => console.log(`⚠️ Telegraf Error: ${err.message}`));
 
 async function restoreSessions() {
     const authPath = './auth_info';
@@ -59,7 +43,7 @@ async function restoreSessions() {
             const userId = folder.replace('session_', '');
             const user = await User.findById(userId);
             if (user && user.expiry > Date.now()) {
-                await sleep(3000); 
+                await sleep(5000); // انتظار طويل عند البدء لتخفيف الحمل
                 startBaileysSession(userId, null);
             }
         }
@@ -67,12 +51,12 @@ async function restoreSessions() {
 }
 
 // ============================================================
-// 3. محرك Baileys (توقيع ويندوز)
+// 3. محرك Baileys (إعدادات التوافق القصوى)
 // ============================================================
 async function startBaileysSession(userId, ctx) {
     if (sessions[userId] && sessions[userId].status === 'CONNECTING') return;
 
-    if (ctx) ctx.reply('🚀 **جاري الاتصال (Windows Engine)...**').catch(()=>{});
+    if (ctx) ctx.reply('🚀 **جاري تجهيز الاتصال...**').catch(()=>{});
 
     const sessionDir = `./auth_info/session_${userId}`;
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
@@ -83,12 +67,14 @@ async function startBaileysSession(userId, ctx) {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        // 🔥 تغيير التوقيع إلى Windows لتجنب حظر 515 من سيرفرات لينكس
-        browser: Browsers.macOS('Desktop'), 
-        syncFullHistory: false,
-        connectTimeoutMs: 60000, 
-        retryRequestDelayMs: 5000,
-        keepAliveIntervalMs: 30000
+        // 🔥 التعديل السحري: استخدام اسم متصفح مخصص لتجاوز التعليق
+        browser: ['Bota-Connect', 'Chrome', '3.0.0'], 
+        syncFullHistory: false, // لا تحمل التاريخ القديم
+        markOnlineOnConnect: false, // لا تظهر متصل فوراً (يساعد في التسريع)
+        connectTimeoutMs: 60000, // 60 ثانية مهلة
+        defaultQueryTimeoutMs: 0, // انتظار لانهائي للاستعلامات
+        keepAliveIntervalMs: 10000, 
+        retryRequestDelayMs: 5000
     });
 
     sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [] };
@@ -101,7 +87,7 @@ async function startBaileysSession(userId, ctx) {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
                 await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز الجديد**\nتم تغيير النظام.',
+                    caption: '📱 **امسح الرمز الآن**\n⚡ نصيحة: إذا تأخر الربط، قم بأرشفة بعض المحادثات في هاتفك.',
                     ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]])
                 });
             } catch (e) {}
@@ -111,17 +97,17 @@ async function startBaileysSession(userId, ctx) {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log(`❌ Status: ${statusCode}`);
             
-            // التعامل مع 515 بتأخير ذكي
-            if (statusCode === 515) {
-                console.log('⏳ 515 Error. Restarting in 5s...');
-                setTimeout(() => startBaileysSession(userId, null), 5000); 
+            // التعامل مع الخطأ 515 والخطأ 428 (Precondition Required)
+            if (statusCode === 515 || statusCode === 428) {
+                console.log('⏳ Network busy. Retrying in 5s...');
+                setTimeout(() => startBaileysSession(userId, null), 5000);
                 return;
             }
 
             if (statusCode === 401 || statusCode === 403 || statusCode === 405) {
                 delete sessions[userId];
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                if (ctx) ctx.reply('⚠️ انتهت الجلسة. أعد المسح.');
+                if (ctx) ctx.reply('⚠️ الجلسة غير صالحة. امسح الرمز مجدداً.');
             } 
             else if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
@@ -137,13 +123,14 @@ async function startBaileysSession(userId, ctx) {
             sessions[userId].status = 'READY';
             if (ctx) {
                 try { await ctx.deleteMessage(); } catch(e){}
-                ctx.reply('✅ **تم الاتصال بنجاح!**', Markup.inlineKeyboard([[Markup.button.callback('📂 القائمة', 'main_menu')]]));
+                ctx.reply('✅ **تم الربط بنجاح!**', Markup.inlineKeyboard([[Markup.button.callback('📂 القائمة', 'main_menu')]]));
             }
         }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
+    // استقبال الرسائل
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
@@ -158,44 +145,26 @@ async function startBaileysSession(userId, ctx) {
 }
 
 // ============================================================
-// 4. القوائم والأزرار + أمر التصفير
+// 4. القوائم + زر التصفير (Reset)
 // ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
     const isAdmin = (ctx.from.id.toString() == ADMIN_ID);
     if (!isAdmin) {
-        if (ctx.message && ['/start', '/reset'].includes(ctx.message.text)) return next(); // السماح بـ Reset
-        if (ctx.callbackQuery && ctx.callbackQuery.data.startsWith('req_')) return next();
+        if (ctx.message && ['/start', '/reset'].includes(ctx.message.text)) return next();
         const user = await User.findById(ctx.from.id.toString());
         if (!user || user.expiry < Date.now()) return ctx.reply('⛔ اشتراكك منتهي.');
     }
     return next();
 });
 
-// 🔥🔥🔥 الأمر الجديد للتصفير الشامل 🔥🔥🔥
+// زر التصفير لحل المشاكل العالقة
 bot.command('reset', async (ctx) => {
     const userId = ctx.from.id.toString();
-    ctx.reply('☢️ **جاري تنفيذ التصفير الشامل (Files + DB)...**');
-
-    // 1. إنهاء الاتصال الحي
-    if (sessions[userId]) {
-        try { sessions[userId].sock.end(); } catch(e) {}
-        delete sessions[userId];
-    }
-
-    // 2. حذف ملفات الجلسة من السيرفر
     const sessionDir = `./auth_info/session_${userId}`;
-    if (fs.existsSync(sessionDir)) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
-        console.log(`Deleted files for ${userId}`);
-    }
-
-    // 3. (اختياري) تنظيف قاعدة البيانات إذا كنت تشك بها
-    // ملاحظة: هذا لن يحذف اشتراكك (User)، بل فقط الردود أو أي بيانات جلسة إن وجدت
-    // إذا كنت تريد حذف كل شيء فعلاً، أخبرني لأضيف سطر حذف User
-    
-    await sleep(2000);
-    ctx.reply('✅ **تم التصفير بنجاح!**\nالآن أنت "مستخدم جديد" تماماً.\nاضغط /start للبدء من الصفر.');
+    if (sessions[userId]) { try { sessions[userId].sock.end(); } catch(e){} delete sessions[userId]; }
+    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+    ctx.reply('☢️ **تم تصفير جلستك.**\nالآن حاول الربط من جديد.');
 });
 
 async function showMainMenu(ctx) {
@@ -231,7 +200,7 @@ bot.action('retry_login', async (ctx) => {
     if (sessions[userId]) delete sessions[userId];
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     try { await ctx.deleteMessage(); } catch(e) {}
-    ctx.reply('🔄 إعادة تعيين...');
+    ctx.reply('🔄 محاولة جديدة...');
     setTimeout(() => startBaileysSession(userId, ctx), 2000);
 });
 
@@ -293,7 +262,6 @@ bot.on('text', async (ctx) => {
     }
 });
 
-// خدمات فرعية
 bot.action('my_replies', async (ctx) => {
     const c = await Reply.countDocuments({ userId: ctx.from.id.toString() });
     ctx.editMessageText(`الردود: ${c}`, Markup.inlineKeyboard([[Markup.button.callback('➕', 'add_rep'), Markup.button.callback('🔙', 'services_menu')]]));
