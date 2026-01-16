@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 1. تحديث الحزم وتثبيت مكتبات كروم الضرورية
+# 1. تثبيت المكتبات النظامية
 apt-get update && apt-get install -y wget gnupg \
   fonts-liberation \
   libappindicator3-1 \
@@ -37,5 +37,8 @@ apt-get update && apt-get install -y wget gnupg \
   lsb-release \
   xdg-utils
 
-# 2. تثبيت متصفح كروم يدوياً لضمان وجوده
-npx puppeteer browsers install chrome
+# 2. إنشاء مجلد الكاش يدوياً
+mkdir -p /opt/render/project/src/.cache
+
+# 3. إجبار Puppeteer على تنزيل كروم داخل هذا المجلد
+npx puppeteer browsers install chrome --path /opt/render/project/src/.cache
