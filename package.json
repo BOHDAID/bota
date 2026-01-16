@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
+    "build": "./render-build.sh", 
     "start": "node index.js"
   },
   "dependencies": {
@@ -11,7 +12,8 @@
     "mongoose": "^8.0.0",
     "qrcode": "^1.5.3",
     "telegraf": "^4.15.0",
-    "whatsapp-web.js": "^1.23.0"
+    "whatsapp-web.js": "^1.23.0",
+    "puppeteer": "^22.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
