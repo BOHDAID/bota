@@ -11,17 +11,22 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Conflict Fix)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Auto-Fix 515)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
-// 2. الإعدادات
+// 2. إعدادات قاعدة البيانات
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI).then(() => restoreSessions()).catch(e => console.log(e));
+mongoose.connect(MONGO_URI)
+    .then(() => {
+        console.log('✅ MongoDB Connected!');
+        restoreSessions(); 
+    })
+    .catch(err => console.error('❌ MongoDB Error:', err));
 
 const User = mongoose.model('User', new mongoose.Schema({ _id: String, expiry: Number }));
 const Setting = mongoose.model('Setting', new mongoose.Schema({ key: String, value: String }));
@@ -33,12 +38,18 @@ const userStates = {};
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+bot.catch((err) => console.log('⚠️ Telegraf Error:', err.message));
 
-// 🛑 منع الانهيار بسبب الـ Conflict 409
-bot.catch((err) => {
-    console.log(`⚠️ Telegraf Error: ${err.message}`);
-    // لا نوقف البوت، فقط نسجل الخطأ ونستمر
-});
+async function fetchAdmin() {
+    if (!ADMIN_ID) return;
+    try {
+        const chat = await bot.telegram.getChat(ADMIN_ID);
+        if(chat.username) {
+            await Setting.findOneAndUpdate({ key: 'admin_user' }, { value: chat.username }, { upsert: true });
+        }
+    } catch (e) {}
+}
+fetchAdmin();
 
 async function restoreSessions() {
     const authPath = './auth_info';
@@ -46,17 +57,19 @@ async function restoreSessions() {
         const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_'));
         for (const folder of folders) {
             const userId = folder.replace('session_', '');
-            const user = await User.findById(userId);
-            if (user && user.expiry > Date.now()) {
-                await sleep(3000); // انتظار لعدم الضغط
-                startBaileysSession(userId, null);
-            }
+            try {
+                const user = await User.findById(userId);
+                if (user && user.expiry > Date.now()) {
+                    await sleep(3000); // انتظار لعدم الضغط على السيرفر
+                    startBaileysSession(userId, null);
+                }
+            } catch (e) {}
         }
     }
 }
 
 // ============================================================
-// 3. محرك Baileys (المضاد للأخطاء)
+// 3. محرك Baileys (مزود بكاسر الحلقة 515)
 // ============================================================
 async function startBaileysSession(userId, ctx) {
     if (sessions[userId] && sessions[userId].status === 'CONNECTING') return;
@@ -72,12 +85,12 @@ async function startBaileysSession(userId, ctx) {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        // استخدام توقيع Ubuntu ليتوافق مع Render
-        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        // استخدام توقيع Ubuntu ليتوافق مع Docker/Render
+        browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: false,
         connectTimeoutMs: 60000, 
-        retryRequestDelayMs: 5000, // انتظار 5 ثواني
-        keepAliveIntervalMs: 30000
+        retryRequestDelayMs: 2000,
+        keepAliveIntervalMs: 10000
     });
 
     sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [] };
@@ -90,7 +103,7 @@ async function startBaileysSession(userId, ctx) {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
                 await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز**\nتم تأمين الاتصال.',
+                    caption: '📱 **امسح الرمز**\nتم تنظيف الجلسة.',
                     ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]])
                 });
             } catch (e) {}
@@ -99,18 +112,33 @@ async function startBaileysSession(userId, ctx) {
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log(`❌ Status: ${statusCode}`);
-
-            // تجاهل وإعادة محاولة هادئة للخطأ 515
+            
+            // 🧨 الكود الكاسر للحلقة 🧨
+            // إذا واجهنا خطأ 515، فهذا يعني أن ملف الجلسة لا يتوافق مع السيرفر
+            // الحل: نحذفه فوراً ونطلب كيو آر جديد
             if (statusCode === 515) {
-                console.log('⏳ 515 Loop prevention: Waiting 5s...');
-                setTimeout(() => startBaileysSession(userId, null), 5000);
+                console.log('🔥 515 Loop Detected! Deleting corrupted session...');
+                delete sessions[userId];
+                if (fs.existsSync(sessionDir)) {
+                    fs.rmSync(sessionDir, { recursive: true, force: true });
+                }
+                
+                if (ctx) {
+                    ctx.reply('⚠️ تم اكتشاف ملف جلسة تالف (Error 515). تم حذفه تلقائياً.\n**يرجى مسح الرمز الجديد.**');
+                    // إعادة التشغيل بعد ثانيتين (سيطلب QR جديد)
+                    setTimeout(() => startBaileysSession(userId, ctx), 2000);
+                } else {
+                    // إذا كان يعمل في الخلفية بدون ctx، نعيد المحاولة مرة واحدة فقط
+                    setTimeout(() => startBaileysSession(userId, null), 2000);
+                }
                 return;
             }
 
+            // باقي الأخطاء
             if (statusCode === 401 || statusCode === 403 || statusCode === 405) {
                 delete sessions[userId];
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                if (ctx) ctx.reply('⚠️ انتهت الجلسة. أعد الربط.');
+                if (ctx) ctx.reply('⚠️ انتهت الجلسة. أعد المسح.');
             } 
             else if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
