@@ -7,15 +7,15 @@ const mongoose = require('mongoose');
 const express = require('express');
 
 // ============================================================
-// 1. سيرفر Render (Keep-Alive)
+// 1. سيرفر Render (لإبقاء البوت نشطاً)
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Baileys Bot is Running (Lightweight)!'));
+app.get('/', (req, res) => res.send('✅ Baileys Bot Running (Auto-Fix Mode)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
-// 2. إعدادات قاعدة البيانات
+// 2. إعدادات قاعدة البيانات والتلجرام
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
@@ -43,7 +43,7 @@ const userStates = {};
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 bot.catch((err) => console.log('Telegraf Error:', err));
 
-// استعادة الجلسات
+// استعادة الجلسات عند إعادة تشغيل السيرفر
 async function restoreSessions() {
     const authPath = './auth_info';
     if (fs.existsSync(authPath)) {
@@ -52,7 +52,9 @@ async function restoreSessions() {
             const userId = folder.replace('session_', '');
             try {
                 const user = await User.findById(userId);
+                // فقط إذا كان المستخدم مشتركاً
                 if (user && user.expiry > Date.now()) {
+                    console.log(`🔄 Restoring session for ${userId}`);
                     startBaileysSession(userId, null);
                 }
             } catch (e) {}
@@ -61,152 +63,259 @@ async function restoreSessions() {
 }
 
 // ============================================================
-// 3. محرك Baileys (بديل المتصفح)
+// 3. محرك Baileys (النظام الذكي)
 // ============================================================
 async function startBaileysSession(userId, ctx) {
-    if (sessions[userId]) return;
+    // منع تكرار الجلسات النشطة
+    if (sessions[userId] && sessions[userId].status === 'CONNECTING') return;
 
-    if (ctx) ctx.reply('🚀 **جاري إنشاء الاتصال المباشر...**');
+    if (ctx) ctx.reply('🚀 **جاري بدء الاتصال...**');
 
-    // إعداد مجلد المصادقة
-    const { state, saveCreds } = await useMultiFileAuthState(`./auth_info/session_${userId}`);
+    const sessionDir = `./auth_info/session_${userId}`;
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
     const sock = makeWASocket({
-        logger: pino({ level: 'silent' }),
+        logger: pino({ level: 'silent' }), // كتم السجلات لتوفير الذاكرة
         printQRInTerminal: false,
         auth: state,
-        browser: Browsers.macOS('Desktop'), // الظهور كمتصفح عادي
-        syncFullHistory: false // ⛔ منع تحميل الرسائل القديمة (توفير الرام)
+        // استخدام توقيع متصفح حقيقي لتجنب الحظر والمشاكل
+        browser: Browsers.ubuntu('Chrome'), 
+        syncFullHistory: false, // ⛔ هام: منع تحميل الرسائل القديمة لتوفير الرام
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000,
+        emitOwnEvents: false,
+        retryRequestDelayMs: 250
     });
 
     sessions[userId] = { sock, status: 'CONNECTING' };
 
-    // إدارة أحداث الاتصال
+    // --- إدارة أحداث الاتصال ---
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
+        // إرسال كيو آر كود (QR)
         if (qr && ctx) {
-            // إرسال كيو آر للتليجرام
             try {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
-                await ctx.replyWithPhoto({ source: buffer }, { caption: '📱 **امسح الرمز (Baileys)**\nسريع وخفيف جداً.' });
+                await ctx.replyWithPhoto({ source: buffer }, { 
+                    caption: '📱 **امسح الرمز (Baileys)**\nنظام خفيف وسريع.',
+                    ...Markup.inlineKeyboard([[Markup.button.callback('🔄 طلب رمز جديد', 'retry_login')]])
+                });
             } catch (e) {}
         }
 
+        // حالة الانفصال أو الإغلاق
         if (connection === 'close') {
-            const shouldReconnect = (lastDisconnect.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`Connection closed due to ${lastDisconnect.error}, reconnecting: ${shouldReconnect}`);
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const errorMsg = lastDisconnect?.error?.message || 'Unknown';
+
+            console.log(`❌ Connection closed for ${userId}: ${errorMsg} (Code: ${statusCode})`);
             
             delete sessions[userId];
-            
-            if (shouldReconnect) {
-                startBaileysSession(userId, null); // إعادة اتصال تلقائي
-            } else {
-                if (ctx) ctx.reply('❌ تم تسجيل الخروج.');
-                // حذف ملفات الجلسة
-                fs.rmSync(`./auth_info/session_${userId}`, { recursive: true, force: true });
+
+            // 🛡️ المنطق الذكي للإصلاح التلقائي 🛡️
+            const isCorrupt = 
+                errorMsg.includes('Connection Failure') || 
+                errorMsg.includes('Stream Errored') ||
+                errorMsg.includes('Restart Required') ||
+                statusCode === DisconnectReason.restartRequired;
+
+            if (isCorrupt) {
+                console.log(`⚠️ Session corrupt for ${userId}. Deleting and resetting...`);
+                // حذف الملفات التالفة
+                if (fs.existsSync(sessionDir)) {
+                    fs.rmSync(sessionDir, { recursive: true, force: true });
+                }
+                if (ctx) ctx.reply('⚠️ تم اكتشاف ملف تالف. تمت إعادة الضبط، يرجى مسح الرمز مجدداً.');
+                // إعادة المحاولة من الصفر
+                setTimeout(() => startBaileysSession(userId, ctx), 2000);
+            } 
+            else if (statusCode !== DisconnectReason.loggedOut) {
+                // إعادة اتصال عادية (مشكلة نت)
+                console.log('🔄 Reconnecting...');
+                startBaileysSession(userId, null);
+            } 
+            else {
+                // تسجيل خروج نهائي
+                console.log('⛔ Logged out.');
+                if (ctx) ctx.reply('❌ تم تسجيل الخروج من الهاتف.');
+                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
             }
-        } else if (connection === 'open') {
-            console.log('✅ Opened connection');
+        } 
+        else if (connection === 'open') {
+            console.log(`✅ ${userId} Connected Successfully!`);
             sessions[userId].status = 'READY';
-            if (ctx) ctx.reply('✅ **تم الاتصال بنجاح!**');
+            if (ctx) ctx.reply('✅ **تم الاتصال بنجاح!**\nالبوت جاهز للعمل.');
         }
     });
 
-    // حفظ الاعتمادات
+    // حفظ بيانات الجلسة تلقائياً
     sock.ev.on('creds.update', saveCreds);
 
-    // استقبال الرسائل (للرد التلقائي)
+    // --- استقبال الرسائل والرد التلقائي ---
     sock.ev.on('messages.upsert', async ({ messages }) => {
         const msg = messages[0];
         if (!msg.message || msg.key.fromMe) return;
 
         const remoteJid = msg.key.remoteJid;
-        const textMessage = msg.message.conversation || msg.message.extendedTextMessage?.text;
+        
+        // استخراج النص من أي نوع رسالة (نص، صورة، فيديو)
+        const textMessage = msg.message.conversation || 
+                            msg.message.extendedTextMessage?.text || 
+                            msg.message.imageMessage?.caption ||
+                            msg.message.videoMessage?.caption;
 
         if (!textMessage) return;
 
         try {
-            // البحث عن رد في القاعدة
-            const reply = await Reply.findOne({ userId: userId, keyword: textMessage });
+            // البحث عن الرد في قاعدة البيانات
+            // استخدمنا Regex لجعل البحث غير حساس لحالة الأحرف
+            const reply = await Reply.findOne({ 
+                userId: userId, 
+                keyword: { $regex: new RegExp(`^${textMessage.trim()}$`, 'i') } 
+            });
+
             if (reply) {
-                await sock.sendMessage(remoteJid, { text: reply.response });
+                await sock.sendMessage(remoteJid, { text: reply.response }, { quoted: msg });
             }
         } catch (e) {
-            console.log('Reply error', e);
+            console.error('Auto-reply error:', e);
         }
     });
 }
 
 // ============================================================
-// 4. أزرار وأوامر التيليجرام
+// 4. واجهة تليجرام
 // ============================================================
 
+// القائمة الرئيسية
 bot.start((ctx) => {
-    ctx.reply('👋 مرحباً بك في بوت واتساب الخفيف (Baileys).\nاضغط أدناه للبدء.', 
-        Markup.inlineKeyboard([[Markup.button.callback('🔗 ربط واتساب', 'connect_wa')]]));
+    ctx.reply('👋 **مرحباً بك في البوت المطور**\nيعمل بنظام Baileys الخفيف جداً.', 
+        Markup.inlineKeyboard([
+            [Markup.button.callback('🔗 ربط واتساب', 'connect_wa')],
+            [Markup.button.callback('📂 الخدمات', 'services_menu')],
+            [Markup.button.callback('❌ خروج نهائي', 'logout')]
+        ]));
 });
 
+// الأزرار
 bot.action('connect_wa', (ctx) => {
     const userId = ctx.from.id.toString();
     startBaileysSession(userId, ctx);
 });
 
-// خدمة جلب الجروبات
-bot.command('groups', async (ctx) => {
+bot.action('retry_login', async (ctx) => {
     const userId = ctx.from.id.toString();
-    const s = sessions[userId];
-    if (!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
-
-    try {
-        const groups = await s.sock.groupFetchAllParticipating();
-        const groupList = Object.values(groups).map(g => `▫️ ${g.subject}`).join('\n');
-        ctx.reply(`📂 **الجروبات:**\n\n${groupList.substring(0, 4000)}`);
-    } catch (e) {
-        ctx.reply('خطأ في جلب الجروبات.');
-    }
-});
-
-// خدمة النشر (Broadcast)
-bot.command('cast', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const s = sessions[userId];
-    if (!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
-
-    // مثال بسيط للنشر: يطلب النص ثم يرسل لكل الجروبات
-    // (يمكن تطويره ليكون بأزرار مثل الكود السابق)
-    const text = ctx.message.text.replace('/cast ', '');
-    if (!text || text === '/cast') return ctx.reply('أكتب الرسالة بعد الأمر.\nمثال: /cast مرحبا');
-
-    ctx.reply('⏳ جاري النشر...');
-    const groups = await s.sock.groupFetchAllParticipating();
-    const groupIds = Object.keys(groups);
-
-    let count = 0;
-    for (const id of groupIds) {
-        try {
-            await s.sock.sendMessage(id, { text: text });
-            count++;
-            await new Promise(r => setTimeout(r, 1000)); // انتظار ثانية
-        } catch (e) {}
-    }
-    ctx.reply(`✅ تم النشر في ${count} جروب.`);
-});
-
-// إضافة رد تلقائي
-bot.command('addreply', async (ctx) => {
-    // تنسيق: /addreply كلمة | رد
-    const args = ctx.message.text.split('|');
-    if (args.length < 2) return ctx.reply('خطأ. التنسيق:\n/addreply كلمة | الرد');
+    ctx.editMessageText('🧹 **تنظيف وإعادة محاولة...**');
     
-    const keyword = args[0].replace('/addreply ', '').trim();
+    // تنظيف يدوي
+    const sessionDir = `./auth_info/session_${userId}`;
+    if (sessions[userId]) {
+        try { sessions[userId].sock.end(); } catch(e){}
+        delete sessions[userId];
+    }
+    if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+    
+    await new Promise(r => setTimeout(r, 2000));
+    startBaileysSession(userId, ctx);
+});
+
+bot.action('logout', (ctx) => {
+    const userId = ctx.from.id.toString();
+    const sessionDir = `./auth_info/session_${userId}`;
+    
+    if (sessions[userId]) {
+        try { sessions[userId].sock.end(); } catch(e){}
+        delete sessions[userId];
+    }
+    if (fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+    ctx.editMessageText('✅ تم تسجيل الخروج وحذف البيانات.');
+});
+
+// قائمة الخدمات
+bot.action('services_menu', (ctx) => {
+    ctx.editMessageText('📂 **الخدمات المتاحة:**\nاستخدم الأوامر التالية:', Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 القائمة الرئيسية', 'main_menu')]
+    ]));
+    ctx.reply(
+        `📌 **الأوامر:**\n\n` +
+        `1️⃣ **إضافة رد تلقائي:**\n/addreply كلمة | الرد\n\n` +
+        `2️⃣ **عرض الجروبات:**\n/groups\n\n` +
+        `3️⃣ **نشر رسالة للكل:**\n/cast رسالتك هنا`
+    );
+});
+bot.action('main_menu', (ctx) => ctx.reply('القائمة الرئيسية:', Markup.inlineKeyboard([[Markup.button.callback('🔗 ربط واتساب', 'connect_wa')]])));
+
+// --- الأوامر النصية ---
+
+// 1. إضافة رد
+bot.command('addreply', async (ctx) => {
+    const args = ctx.message.text.split('|');
+    if (args.length < 2) return ctx.reply('⚠️ خطأ في التنسيق.\nاستخدم: `/addreply مرحبا | أهلاً بك`');
+    
+    const keyword = args[0].replace('/addreply', '').trim();
     const response = args[1].trim();
     const userId = ctx.from.id.toString();
 
     await Reply.create({ userId, keyword, response });
-    ctx.reply('✅ تم حفظ الرد.');
+    ctx.reply(`✅ تم حفظ الرد على كلمة: "${keyword}"`);
 });
 
-bot.launch();
-process.once('SIGINT', () => bot.stop());
+// 2. عرض الجروبات
+bot.command('groups', async (ctx) => {
+    const userId = ctx.from.id.toString();
+    const s = sessions[userId];
+    
+    if (!s || s.status !== 'READY') return ctx.reply('⚠️ يجب ربط الواتساب أولاً.');
+
+    try {
+        ctx.reply('⏳ جاري جلب القائمة...');
+        const groups = await s.sock.groupFetchAllParticipating();
+        const list = Object.values(groups).map((g, i) => `${i+1}. ${g.subject}`).join('\n');
+        
+        if (list.length > 4000) {
+            ctx.reply(`📂 **أول 50 جروب:**\n\n${list.substring(0, 4000)}...`);
+        } else {
+            ctx.reply(`📂 **الجروبات (${Object.keys(groups).length}):**\n\n${list || 'لا يوجد جروبات'}`);
+        }
+    } catch (e) {
+        ctx.reply('❌ حدث خطأ أثناء جلب الجروبات.');
+    }
+});
+
+// 3. النشر (Broadcast)
+bot.command('cast', async (ctx) => {
+    const userId = ctx.from.id.toString();
+    const s = sessions[userId];
+    const text = ctx.message.text.replace('/cast', '').trim();
+
+    if (!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
+    if (!text) return ctx.reply('⚠️ اكتب الرسالة بعد الأمر.\nمثال: `/cast السلام عليكم`');
+
+    try {
+        ctx.reply('⏳ جاري النشر...');
+        const groups = await s.sock.groupFetchAllParticipating();
+        const ids = Object.keys(groups);
+        
+        let sentCount = 0;
+        for (const id of ids) {
+            await s.sock.sendMessage(id, { text: text });
+            sentCount++;
+            await new Promise(r => setTimeout(r, 1000)); // انتظار ثانية بين كل رسالة
+        }
+        ctx.reply(`✅ تم النشر في ${sentCount} جروب.`);
+    } catch (e) {
+        ctx.reply('❌ حدث خطأ أثناء النشر.');
+    }
+});
+
+// تشغيل البوت
+bot.launch().then(() => console.log('🤖 Telegram Bot Started'));
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
