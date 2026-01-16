@@ -5,13 +5,11 @@ const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const express = require('express');
 
-// 1. Render Server
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Ready (Firefox Mode)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Ultra Light Mode)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
-// 2. Settings
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
@@ -24,11 +22,10 @@ const Reply = mongoose.model('Reply', new mongoose.Schema({ userId: String, keyw
 const sessions = {}; 
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// 3. Baileys Engine
 async function startBaileysSession(userId, ctx, phoneNumber = null) {
     const sessionDir = `./auth_info/session_${userId}`;
     
-    // تنظيف إذا كان طلب جديد
+    // تنظيف كامل قبل البدء
     if (phoneNumber && fs.existsSync(sessionDir)) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -41,29 +38,31 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        // 🔥 التغيير هنا: استخدام فايرفوكس لأنه أبطأ وأكثر صبراً في الربط
-        browser: ['Ubuntu', 'Firefox', '20.0.04'],
-        syncFullHistory: false,
+        // استخدام توقيع Ubuntu وهو الأسرع والأخف لسيرفرات Render
+        browser: ['Ubuntu', 'Chrome', '20.0.04'],
+        // ⛔ منع تحميل أي شيء قديم لتسريع الربط
+        syncFullHistory: false, 
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
+        // إعدادات الشبكة
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 5000
+        keepAliveIntervalMs: 20000,
+        retryRequestDelayMs: 3000
     });
 
     sessions[userId] = { sock };
 
-    // 🔥 طلب الكود مع تأخير بسيط لضمان استقرار الاتصال
     if (phoneNumber && !sock.authState.creds.registered) {
         setTimeout(async () => {
             try {
                 let cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
-                // ننتظر 3 ثواني إضافية للتأكد من أن السيرفر متصل تماماً
                 await delay(3000); 
                 const code = await sock.requestPairingCode(cleanNumber);
-                if (ctx) ctx.reply(`🔢 **رمز الربط:**\n\`${code}\`\n\n⚠️ انسخ الرمز بسرعة وضعه في واتساب.`, { parse_mode: 'Markdown' });
+                if (ctx) ctx.reply(`🔢 **رمز الربط:**\n\`${code}\`\n\n⚡ **بسرعة!** ضعه في واتساب الآن.\n⚠️ وافق على رسالة "الاحتيال" إذا ظهرت.`, { parse_mode: 'Markdown' });
             } catch (e) {
-                if (ctx) ctx.reply('❌ فشل طلب الرمز. هل الرقم صحيح؟');
+                if (ctx) ctx.reply('❌ فشل طلب الرمز. حاول مجدداً.');
             }
-        }, 5000); // تأخير 5 ثواني قبل الطلب
+        }, 5000);
     }
 
     sock.ev.on('connection.update', async (update) => {
@@ -71,6 +70,7 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            // إعادة المحاولة فقط إذا لم يتم الطرد
             if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
             } else {
@@ -81,7 +81,7 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         } 
         else if (connection === 'open') {
             console.log(`✅ ${userId} Connected!`);
-            if (ctx) ctx.reply('✅ **تم الربط بنجاح!** 🥳', Markup.inlineKeyboard([[Markup.button.callback('القائمة', 'main_menu')]]));
+            if (ctx) ctx.reply('✅ **تم الربط بنجاح!** 🥳\nالبوت جاهز.', Markup.inlineKeyboard([[Markup.button.callback('القائمة', 'main_menu')]]));
         }
     });
 
@@ -99,16 +99,16 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
     });
 }
 
-// 4. UI
+// UI
 bot.start((ctx) => {
-    ctx.reply('👋 أهلاً بك. اختر الطريقة:', Markup.inlineKeyboard([
+    ctx.reply('👋 أهلاً بك. تأكد من أرشفة محادثاتك لضمان الربط السريع.', Markup.inlineKeyboard([
         [Markup.button.callback('📱 ربط برقم الهاتف', 'login_phone')],
-        [Markup.button.callback('🗑️ تصفير (Reset)', 'logout')]
+        [Markup.button.callback('🗑️ تصفير', 'logout')]
     ]));
 });
 
 bot.action('login_phone', (ctx) => {
-    ctx.reply('📞 أرسل رقمك الآن (مثال: 966500000000)');
+    ctx.reply('📞 أرسل رقمك الآن:');
     sessions[ctx.from.id] = { step: 'WAIT_PHONE' };
 });
 
@@ -131,7 +131,7 @@ bot.on('text', async (ctx) => {
 
     if (sessions[userId]?.step === 'WAIT_PHONE') {
         const phone = text.replace(/[^0-9]/g, '');
-        ctx.reply('⏳ لحظة...');
+        ctx.reply('⏳ جاري الاتصال...');
         delete sessions[userId].step;
         startBaileysSession(userId, ctx, phone);
         return;
