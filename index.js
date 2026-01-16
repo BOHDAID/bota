@@ -11,7 +11,7 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Anti-Timeout Mode)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Windows Signature)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
@@ -36,29 +36,26 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 bot.catch((err) => console.log(`⚠️ Telegraf Error: ${err.message}`));
 
 async function restoreSessions() {
+    // تنظيف أولي لضمان عدم وجود ملفات تالفة من البداية
     const authPath = './auth_info';
-    if (fs.existsSync(authPath)) {
-        const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_'));
-        for (const folder of folders) {
-            const userId = folder.replace('session_', '');
-            const user = await User.findById(userId);
-            if (user && user.expiry > Date.now()) {
-                await sleep(5000); // انتظار طويل عند البدء لتخفيف الحمل
-                startBaileysSession(userId, null);
-            }
-        }
-    }
+    if (!fs.existsSync(authPath)) fs.mkdirSync(authPath);
 }
 
 // ============================================================
-// 3. محرك Baileys (إعدادات التوافق القصوى)
+// 3. محرك Baileys (هوية ويندوز)
 // ============================================================
 async function startBaileysSession(userId, ctx) {
     if (sessions[userId] && sessions[userId].status === 'CONNECTING') return;
 
-    if (ctx) ctx.reply('🚀 **جاري تجهيز الاتصال...**').catch(()=>{});
+    if (ctx) ctx.reply('🚀 **جاري الاتصال (Windows Mode)...**').catch(()=>{});
 
     const sessionDir = `./auth_info/session_${userId}`;
+    
+    // إذا كان المجلد موجوداً وفيه مشاكل، نحذفه ونبدأ نظيفاً
+    if (ctx && fs.existsSync(sessionDir)) {
+        fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
     const { version } = await fetchLatestBaileysVersion();
 
@@ -67,14 +64,12 @@ async function startBaileysSession(userId, ctx) {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        // 🔥 التعديل السحري: استخدام اسم متصفح مخصص لتجاوز التعليق
-        browser: ['Bota-Connect', 'Chrome', '3.0.0'], 
-        syncFullHistory: false, // لا تحمل التاريخ القديم
-        markOnlineOnConnect: false, // لا تظهر متصل فوراً (يساعد في التسريع)
-        connectTimeoutMs: 60000, // 60 ثانية مهلة
-        defaultQueryTimeoutMs: 0, // انتظار لانهائي للاستعلامات
-        keepAliveIntervalMs: 10000, 
-        retryRequestDelayMs: 5000
+        // 🔥 التمويه: الظهور كمتصفح ويندوز عادي لتجنب الحظر
+        browser: ["Windows", "Chrome", "10.0"], 
+        syncFullHistory: false,
+        connectTimeoutMs: 60000, 
+        keepAliveIntervalMs: 10000,
+        retryRequestDelayMs: 5000 
     });
 
     sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [] };
@@ -87,7 +82,7 @@ async function startBaileysSession(userId, ctx) {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
                 await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز الآن**\n⚡ نصيحة: إذا تأخر الربط، قم بأرشفة بعض المحادثات في هاتفك.',
+                    caption: '📱 **امسح الرمز**\nهوية الاتصال: Windows 10',
                     ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]])
                 });
             } catch (e) {}
@@ -97,17 +92,18 @@ async function startBaileysSession(userId, ctx) {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             console.log(`❌ Status: ${statusCode}`);
             
-            // التعامل مع الخطأ 515 والخطأ 428 (Precondition Required)
-            if (statusCode === 515 || statusCode === 428) {
-                console.log('⏳ Network busy. Retrying in 5s...');
-                setTimeout(() => startBaileysSession(userId, null), 5000);
+            // التعامل مع 515
+            if (statusCode === 515) {
+                console.log('⏳ 515 detected. Waiting 10s...');
+                // انتظار 10 ثواني كاملة (وليس 5) لتهدئة السيرفر
+                setTimeout(() => startBaileysSession(userId, null), 10000);
                 return;
             }
 
             if (statusCode === 401 || statusCode === 403 || statusCode === 405) {
                 delete sessions[userId];
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                if (ctx) ctx.reply('⚠️ الجلسة غير صالحة. امسح الرمز مجدداً.');
+                if (ctx) ctx.reply('⚠️ انتهت الجلسة. أعد المسح.');
             } 
             else if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
@@ -145,7 +141,7 @@ async function startBaileysSession(userId, ctx) {
 }
 
 // ============================================================
-// 4. القوائم + زر التصفير (Reset)
+// 4. القوائم
 // ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
@@ -158,13 +154,13 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-// زر التصفير لحل المشاكل العالقة
+// تصفير الجلسة
 bot.command('reset', async (ctx) => {
     const userId = ctx.from.id.toString();
     const sessionDir = `./auth_info/session_${userId}`;
     if (sessions[userId]) { try { sessions[userId].sock.end(); } catch(e){} delete sessions[userId]; }
     if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-    ctx.reply('☢️ **تم تصفير جلستك.**\nالآن حاول الربط من جديد.');
+    ctx.reply('☢️ **تم التصفير.**');
 });
 
 async function showMainMenu(ctx) {
@@ -262,6 +258,7 @@ bot.on('text', async (ctx) => {
     }
 });
 
+// خدمات فرعية
 bot.action('my_replies', async (ctx) => {
     const c = await Reply.countDocuments({ userId: ctx.from.id.toString() });
     ctx.editMessageText(`الردود: ${c}`, Markup.inlineKeyboard([[Markup.button.callback('➕', 'add_rep'), Markup.button.callback('🔙', 'services_menu')]]));
