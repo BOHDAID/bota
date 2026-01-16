@@ -1,59 +1,136 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion, delay } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, Browsers, fetchLatestBaileysVersion, delay, initAuthCreds, BufferJSON, proto } = require('@whiskeysockets/baileys');
 const pino = require('pino');
-const fs = require('fs');
 const { Telegraf, Markup } = require('telegraf');
 const mongoose = require('mongoose');
 const express = require('express');
 
-// 1. Render Server
+// ============================================================
+// 1. سيرفر Render
+// ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Menu Fixed)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Anti-Bad-MAC System)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
-// 2. Settings
+// ============================================================
+// 2. إعدادات قاعدة البيانات
+// ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI).then(() => console.log('✅ DB Connected')).catch(e => console.log(e));
+mongoose.connect(MONGO_URI)
+    .then(() => {
+        console.log('✅ MongoDB Connected!');
+        restoreSessions(); 
+    })
+    .catch(err => console.error('❌ MongoDB Error:', err));
 
+// الجداول
 const User = mongoose.model('User', new mongoose.Schema({ _id: String, expiry: Number }));
 const Setting = mongoose.model('Setting', new mongoose.Schema({ key: String, value: String }));
 const Reply = mongoose.model('Reply', new mongoose.Schema({ userId: String, keyword: String, response: String }));
 const History = mongoose.model('History', new mongoose.Schema({ _id: String, date: Number }));
+const SessionModel = mongoose.model('AuthSession', new mongoose.Schema({ _id: String, data: String }));
 
+// المتغيرات
 const sessions = {}; 
 const userStates = {}; 
 const msgRetryCounterCache = new Map();
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// استعادة الجلسات
+// ============================================================
+// 3. محول قاعدة البيانات (MongoDB Auth Adapter)
+// ============================================================
+const useMongoDBAuthState = async (sessionId) => {
+    const writeData = async (data, key) => {
+        try {
+            await SessionModel.findByIdAndUpdate(
+                `${sessionId}-${key}`,
+                { data: JSON.stringify(data, BufferJSON.replacer) },
+                { upsert: true }
+            );
+        } catch (e) { console.error('DB Write Error', e); }
+    };
+
+    const readData = async (key) => {
+        try {
+            const result = await SessionModel.findById(`${sessionId}-${key}`);
+            if (result && result.data) {
+                return JSON.parse(result.data, BufferJSON.reviver);
+            }
+        } catch (e) { console.error('DB Read Error', e); }
+        return null;
+    };
+
+    const removeData = async (key) => {
+        try { await SessionModel.findByIdAndDelete(`${sessionId}-${key}`); } catch (e) {}
+    };
+
+    let creds = await readData('creds');
+    if (!creds) {
+        creds = initAuthCreds();
+        await writeData(creds, 'creds');
+    }
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(ids.map(async (id) => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        if (value) data[id] = value;
+                    }));
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const key = `${category}-${id}`;
+                            if (value) tasks.push(writeData(value, key));
+                            else tasks.push(removeData(key));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: () => writeData(creds, 'creds')
+    };
+};
+
 async function restoreSessions() {
-    const authPath = './auth_info';
-    if (fs.existsSync(authPath)) {
-        const folders = fs.readdirSync(authPath).filter(f => f.startsWith('session_'));
-        for (const folder of folders) {
-            const userId = folder.replace('session_', '');
+    try {
+        const activeSessions = await SessionModel.find({ _id: { $regex: /-creds$/ } });
+        for (const sess of activeSessions) {
+            const userId = sess._id.replace('-creds', '');
             const user = await User.findById(userId);
             if (user && user.expiry > Date.now()) {
                 startBaileysSession(userId, null);
             }
         }
-    }
+    } catch (e) {}
 }
-restoreSessions();
 
-// 3. المحرك
+// ============================================================
+// 4. محرك Baileys (مع حماية Bad MAC)
+// ============================================================
 async function startBaileysSession(userId, ctx, phoneNumber = null) {
     if (sessions[userId] && sessions[userId].status === 'READY' && !phoneNumber) return;
 
-    const sessionDir = `./auth_info/session_${userId}`;
-    if (phoneNumber && fs.existsSync(sessionDir)) {
-        fs.rmSync(sessionDir, { recursive: true, force: true });
+    if (phoneNumber) {
+        // تنظيف كامل عند طلب ربط جديد
+        await SessionModel.deleteMany({ _id: { $regex: `^${userId}-` } });
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+    const { state, saveCreds } = await useMongoDBAuthState(userId);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
@@ -65,7 +142,6 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         msgRetryCounterCache,
         syncFullHistory: false,
         markOnlineOnConnect: false,
-        generateHighQualityLinkPreview: false,
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 10000,
         retryRequestDelayMs: 2000,
@@ -80,7 +156,7 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
                 let cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
                 await delay(2000); 
                 const code = await sock.requestPairingCode(cleanNumber);
-                if (ctx) ctx.reply(`🔢 **الكود:** \`${code}\`\n\nضعه في واتساب بسرعة!`, { parse_mode: 'Markdown' });
+                if (ctx) ctx.reply(`🔢 **رمز الربط:**\n\`${code}\`\n\n⚠️ ضعه في واتساب بسرعة!`, { parse_mode: 'Markdown' });
             } catch (e) {
                 if (ctx) ctx.reply('❌ فشل طلب الرمز.');
             }
@@ -91,37 +167,52 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
         const { connection, lastDisconnect } = update;
 
         if (connection === 'close') {
-            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            if (statusCode === 401 || statusCode === 403) {
+            const error = lastDisconnect?.error;
+            const statusCode = error?.output?.statusCode;
+            const errorMsg = error?.message || '';
+
+            console.log(`❌ Closed: ${statusCode} - ${errorMsg}`);
+
+            // 🔥🔥🔥 كاشف الأخطاء القاتلة (Bad MAC) 🔥🔥🔥
+            // إذا اكتشفنا أن المفاتيح تالفة، نحذف الجلسة فوراً
+            const isCorrupted = 
+                errorMsg.includes('Bad MAC') || 
+                errorMsg.includes('PreKey') || 
+                errorMsg.includes('Signal') ||
+                statusCode === 401 || 
+                statusCode === 403 ||
+                statusCode === 405;
+
+            if (isCorrupted) {
+                 console.log(`☢️ Session CORRUPTED (${userId}). Wiping data...`);
                  delete sessions[userId];
-                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                 if (ctx) ctx.reply('⚠️ انتهت الجلسة.');
-            } else if (statusCode !== DisconnectReason.loggedOut) {
+                 // حذف كل بيانات الجلسة من قاعدة البيانات
+                 await SessionModel.deleteMany({ _id: { $regex: `^${userId}-` } });
+                 
+                 const msg = '⚠️ **تنبيه:** تم اكتشاف خلل في التشفير (Bad MAC).\nتم حذف الجلسة تلقائياً.\nيرجى إعادة الربط.';
+                 if (ctx) ctx.reply(msg);
+                 else bot.telegram.sendMessage(userId, msg).catch(()=>{});
+                 return; // لا نعد الاتصال، ننتظر ربطاً جديداً
+            }
+            
+            if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
             } else {
                 delete sessions[userId];
-                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+                await SessionModel.deleteMany({ _id: { $regex: `^${userId}-` } });
                 if (ctx) ctx.reply('❌ تم تسجيل الخروج.');
             }
         } 
         else if (connection === 'open') {
             console.log(`✅ ${userId} Connected!`);
             sessions[userId].status = 'READY';
-            
-            // 🔥 هنا الحل: إرسال القائمة الجديدة فوراً عند نجاح الاتصال
-            const successMsg = '✅ **تم الاتصال بنجاح!**\nيمكنك الآن استخدام الخدمات.';
             const kb = Markup.inlineKeyboard([
                 [Markup.button.callback('📨 نشر للكل', 'broadcast'), Markup.button.callback('⚙️ الجروبات', 'fetch_groups')],
                 [Markup.button.callback('🤖 الردود', 'my_replies'), Markup.button.callback('❌ خروج', 'logout')],
-                [Markup.button.callback('🔙 القائمة الرئيسية', 'main_menu')]
+                [Markup.button.callback('🔙 القائمة', 'main_menu')]
             ]);
-            
-            if (ctx) {
-                ctx.reply(successMsg, kb);
-            } else {
-                // إذا كان إعادة اتصال تلقائي، أرسل رسالة للمستخدم
-                bot.telegram.sendMessage(userId, successMsg, kb).catch(()=>{});
-            }
+            if (ctx) ctx.reply('✅ **تم الاتصال بنجاح!**', kb);
+            else bot.telegram.sendMessage(userId, '✅ **البوت متصل ويعمل.**', kb).catch(()=>{});
         }
     });
 
@@ -139,7 +230,9 @@ async function startBaileysSession(userId, ctx, phoneNumber = null) {
     });
 }
 
-// 4. Middleware
+// ============================================================
+// 5. باقي الكود (Middleware والقوائم)
+// ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
     const userId = ctx.from.id.toString();
@@ -155,7 +248,6 @@ bot.use(async (ctx, next) => {
     return next();
 });
 
-// 5. القوائم (المعدلة لتظهر الخدمات عند الاتصال)
 async function showMainMenu(ctx) {
     const userId = ctx.from.id.toString();
     const isAdmin = (userId == ADMIN_ID);
@@ -168,21 +260,18 @@ async function showMainMenu(ctx) {
 
     if (isAdmin || isPaid) {
         msg += `حالة الاتصال: ${isConnected ? '✅ متصل' : '❌ غير متصل'}\n`;
-        
-        // 🔥 إذا كان متصلاً، نعرض زر الخدمات بشكل بارز
         if (isConnected) {
-            buttons.push([Markup.button.callback('🚀 الدخول للخدمات (نشر/ردود)', 'services_menu')]);
+            buttons.push([Markup.button.callback('🚀 الخدمات', 'services_menu')]);
             buttons.push([Markup.button.callback('❌ تسجيل خروج', 'logout')]);
         } else {
-            buttons.push([Markup.button.callback('🔗 ربط واتساب الآن', 'login_check')]);
+            buttons.push([Markup.button.callback('🔗 ربط واتساب', 'login_check')]);
         }
-
         buttons.push([Markup.button.callback('⏳ اشتراكي', 'check_my_sub')]);
         if (isAdmin) buttons.push([Markup.button.callback('🛠️ المدير', 'admin_panel')]);
     } else {
+        const adminSet = await Setting.findOne({ key: 'admin_user' });
         buttons.push([Markup.button.callback('🛒 طلب اشتراك', 'req_sub')]);
     }
-    
     try { await ctx.editMessageText(msg, Markup.inlineKeyboard(buttons)); } catch { await ctx.reply(msg, Markup.inlineKeyboard(buttons)); }
 }
 
@@ -193,33 +282,26 @@ bot.action('login_check', (ctx) => {
     const userId = ctx.from.id.toString();
     if (sessions[userId] && sessions[userId].status === 'READY') {
         ctx.reply('✅ أنت متصل بالفعل.');
-        showMainMenu(ctx);
     } else {
-        ctx.reply('📞 أرسل رقمك (مثال: 9665xxxxxxxx):');
+        ctx.reply('📞 أرسل رقم هاتفك (9665xxxxxxxx):');
         sessions[userId] = { step: 'WAIT_PHONE' };
     }
 });
 
-bot.action('logout', (ctx) => {
+bot.action('logout', async (ctx) => {
     const userId = ctx.from.id.toString();
-    const sessionDir = `./auth_info/session_${userId}`;
     if (sessions[userId]?.sock) { try{sessions[userId].sock.end()}catch(e){} }
-    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
     delete sessions[userId];
-    ctx.editMessageText('✅ تم الخروج.');
+    await SessionModel.deleteMany({ _id: { $regex: `^${userId}-` } });
+    ctx.editMessageText('✅ تم الخروج وحذف البيانات.');
 });
 
-// الخدمات
 bot.action('services_menu', (ctx) => {
-    // فحص مزدوج للتأكد
     const userId = ctx.from.id.toString();
-    if (!sessions[userId] || sessions[userId].status !== 'READY') {
-        return ctx.reply('⚠️ لست متصلاً! اذهب للقائمة الرئيسية واربط واتساب.', Markup.inlineKeyboard([[Markup.button.callback('🔙 القائمة', 'main_menu')]]));
-    }
-
-    ctx.editMessageText('📂 **قائمة الخدمات:**', Markup.inlineKeyboard([
+    if (!sessions[userId] || sessions[userId].status !== 'READY') return ctx.reply('⚠️ لست متصلاً!');
+    ctx.editMessageText('📂 **الخدمات:**', Markup.inlineKeyboard([
         [Markup.button.callback('📨 نشر للكل', 'broadcast'), Markup.button.callback('⚙️ الجروبات', 'fetch_groups')],
-        [Markup.button.callback('🤖 الردود التلقائية', 'my_replies'), Markup.button.callback('🔙 القائمة', 'main_menu')]
+        [Markup.button.callback('🤖 الردود', 'my_replies'), Markup.button.callback('🔙 القائمة', 'main_menu')]
     ]));
 });
 
@@ -231,7 +313,7 @@ bot.action('fetch_groups', async (ctx) => {
         const groups = await s.sock.groupFetchAllParticipating();
         s.allGroups = Object.values(groups).map(g => ({ id: g.id, name: g.subject }));
         sendGroupMenu(ctx, ctx.from.id.toString());
-    } catch { ctx.reply('❌ خطأ في الجروبات'); }
+    } catch { ctx.reply('❌ خطأ'); }
 });
 
 async function sendGroupMenu(ctx, userId) {
@@ -239,7 +321,7 @@ async function sendGroupMenu(ctx, userId) {
     const btns = s.allGroups.slice(0, 20).map(g => [Markup.button.callback(`${s.selected.includes(g.id)?'✅':'⬜'} ${g.name.substring(0,10)}`, `sel_${g.id}`)]);
     btns.push([Markup.button.callback('✅ الكل', 'sel_all'), Markup.button.callback('❌ إلغاء', 'desel_all')]);
     btns.push([Markup.button.callback(`نشر (${s.selected.length})`, 'broadcast')]);
-    try { await ctx.editMessageText('اختر الجروبات:', Markup.inlineKeyboard(btns)); } catch { ctx.reply('اختر الجروبات:', Markup.inlineKeyboard(btns)); }
+    try { await ctx.editMessageText('الجروبات:', Markup.inlineKeyboard(btns)); } catch { ctx.reply('الجروبات:', Markup.inlineKeyboard(btns)); }
 }
 
 bot.action(/sel_(.+)/, (ctx) => {
@@ -261,10 +343,10 @@ bot.action('my_replies', async (ctx) => {
     const c = await Reply.countDocuments({ userId: ctx.from.id.toString() });
     ctx.editMessageText(`🤖 الردود: ${c}`, Markup.inlineKeyboard([[Markup.button.callback('➕ إضافة', 'add_rep'), Markup.button.callback('❌ حذف', 'del_rep')], [Markup.button.callback('🔙 رجوع', 'services_menu')]]));
 });
-bot.action('add_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_KEYWORD' }; ctx.reply('الكلمة المفتاحية:'); });
-bot.action('del_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_DEL_KEY' }; ctx.reply('الكلمة للحذف:'); });
+bot.action('add_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_KEYWORD' }; ctx.reply('الكلمة:'); });
+bot.action('del_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_DEL_KEY' }; ctx.reply('الكلمة:'); });
 
-// طلبات الاشتراك والمدير
+// طلبات الاشتراك
 bot.action('req_sub', async (ctx) => {
     const adminSet = await Setting.findOne({ key: 'admin_user' });
     ctx.editMessageText(`✅ تم الطلب.`, Markup.inlineKeyboard([[Markup.button.url('الدعم', `https://t.me/${adminSet ? adminSet.value : 'Admin'}`)]]));
@@ -278,11 +360,11 @@ bot.action('admin_panel', (ctx) => ctx.editMessageText('🛠️ المدير:', 
     [Markup.button.callback('➕ تفعيل', 'adm_add'), Markup.button.callback('📢 نشر', 'adm_cast')],
     [Markup.button.callback('🔒 قناة', 'adm_force'), Markup.button.callback('🔙 رجوع', 'main_menu')]
 ])));
-bot.action('adm_add', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_SUB_ID' }; ctx.reply('الآيدي (ID):'); });
+bot.action('adm_add', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_SUB_ID' }; ctx.reply('الآيدي:'); });
 bot.action('adm_cast', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CAST' }; ctx.reply('الرسالة:'); });
-bot.action('adm_force', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CHAN' }; ctx.reply('يوزر القناة (أو off):'); });
+bot.action('adm_force', (ctx) => { userStates[ADMIN_ID] = { step: 'ADM_CHAN' }; ctx.reply('اليوزر (أو off):'); });
 
-// معالجة النصوص
+// النصوص
 bot.on('text', async (ctx) => {
     const userId = ctx.from.id.toString();
     const text = ctx.message.text;
@@ -297,9 +379,9 @@ bot.on('text', async (ctx) => {
     }
 
     if (userId == ADMIN_ID && state) {
-        if (state.step === 'ADM_SUB_ID') { await User.findByIdAndUpdate(text, { expiry: Date.now() + 30*86400000 }, { upsert: true }); ctx.reply('✅ تم'); userStates[userId]=null; return; }
-        if (state.step === 'ADM_CAST') { const h = await History.find({}); h.forEach(u => ctx.copyMessage(u._id).catch(()=>{})); ctx.reply('✅ تم'); userStates[userId]=null; return; }
-        if (state.step === 'ADM_CHAN') { await Setting.findOneAndUpdate({key:'force_channel'}, {value:text}, {upsert:true}); ctx.reply('✅ تم'); userStates[userId]=null; return; }
+        if (state.step === 'ADM_SUB_ID') { await User.findByIdAndUpdate(text, { expiry: Date.now() + 30*86400000 }, { upsert: true }); ctx.reply('✅'); userStates[userId]=null; return; }
+        if (state.step === 'ADM_CAST') { const h = await History.find({}); h.forEach(u => ctx.copyMessage(u._id).catch(()=>{})); ctx.reply('✅'); userStates[userId]=null; return; }
+        if (state.step === 'ADM_CHAN') { await Setting.findOneAndUpdate({key:'force_channel'}, {value:text}, {upsert:true}); ctx.reply('✅'); userStates[userId]=null; return; }
     }
 
     const s = sessions[userId];
@@ -311,14 +393,14 @@ bot.on('text', async (ctx) => {
         return;
     }
     if (state?.step === 'WAIT_KEYWORD') { state.tempKey = text; state.step = 'WAIT_REPLY'; return ctx.reply('الرد؟'); }
-    if (state?.step === 'WAIT_REPLY') { await Reply.create({ userId, keyword: state.tempKey, response: text }); userStates[userId]=null; return ctx.reply('✅ تم.'); }
-    if (state?.step === 'WAIT_DEL_KEY') { await Reply.deleteMany({ userId, keyword: text }); userStates[userId]=null; return ctx.reply('✅ تم.'); }
+    if (state?.step === 'WAIT_REPLY') { await Reply.create({ userId, keyword: state.tempKey, response: text }); userStates[userId]=null; return ctx.reply('✅'); }
+    if (state?.step === 'WAIT_DEL_KEY') { await Reply.deleteMany({ userId, keyword: text }); userStates[userId]=null; return ctx.reply('✅'); }
 });
 
 bot.action('check_my_sub', async (ctx) => {
     const user = await User.findById(ctx.from.id.toString());
     const days = user ? Math.floor((user.expiry - Date.now()) / 86400000) : 0;
-    ctx.reply(`الأيام: ${days}`);
+    ctx.reply(`أيام الاشتراك: ${days}`);
 });
 
 bot.launch();
