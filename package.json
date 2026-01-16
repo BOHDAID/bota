@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "build": "./render-build.sh", 
+    "build": "chmod +x render-build.sh && ./render-build.sh", 
     "start": "node index.js"
   },
   "dependencies": {
