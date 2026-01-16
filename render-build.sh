@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 1. تثبيت المكتبات النظامية
+# تثبيت المكتبات
 apt-get update && apt-get install -y wget gnupg \
   fonts-liberation \
   libappindicator3-1 \
@@ -13,7 +13,6 @@ apt-get update && apt-get install -y wget gnupg \
   libexpat1 \
   libfontconfig1 \
   libgbm1 \
-  libgcc1 \
   libglib2.0-0 \
   libgtk-3-0 \
   libnspr4 \
@@ -37,8 +36,5 @@ apt-get update && apt-get install -y wget gnupg \
   lsb-release \
   xdg-utils
 
-# 2. إنشاء مجلد الكاش يدوياً
-mkdir -p /opt/render/project/src/.cache
-
-# 3. إجبار Puppeteer على تنزيل كروم داخل هذا المجلد
+# تنزيل كروم في مسار الكاش
 npx puppeteer browsers install chrome --path /opt/render/project/src/.cache
