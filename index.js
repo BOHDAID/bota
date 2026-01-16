@@ -9,15 +9,15 @@ const axios = require('axios');
 const { execSync } = require('child_process');
 
 // ============================================================
-// 1. سيرفر Render (Keep-Alive)
+// 1. سيرفر Render
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Ultra-Fast Mode)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Memory Saver Mode)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
-// 2. إعدادات قاعدة البيانات
+// 2. الاتصال بالقاعدة
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
@@ -71,14 +71,13 @@ async function restoreSessions() {
                 const user = await User.findById(userId);
                 if (user && user.expiry > Date.now()) {
                     await startUserSession(userId, null); 
-                    await sleep(10000); // 10 ثواني بين كل جلسة لتخفيف الضغط
+                    await sleep(10000); 
                 }
             } catch (e) {}
         }
     }
 }
 
-// دالة البحث عن المسار
 function getChromeExecutablePath() {
     try {
         const cacheDir = path.join(__dirname, '.cache', 'chrome');
@@ -92,7 +91,7 @@ function getChromeExecutablePath() {
 }
 
 // ============================================================
-// 3. محرك الواتساب (نسخة السرعة القصوى)
+// 3. إدارة الجلسات (وضع توفير الذاكرة الأقصى)
 // ============================================================
 async function startUserSession(userId, ctx) {
     if (sessions[userId]) {
@@ -103,7 +102,7 @@ async function startUserSession(userId, ctx) {
         if (sessions[userId].status === 'QR_SENT') return;
     }
 
-    if (ctx) ctx.editMessageText('🚀 **جاري تحضير المتصفح...**\n(قد يستغرق 30 ثانية بسبب ضعف السيرفر)').catch(()=>{});
+    if (ctx) ctx.editMessageText('🚀 **جاري التشغيل (وضع خفيف)...**').catch(()=>{});
 
     const chromePath = getChromeExecutablePath();
 
@@ -115,24 +114,27 @@ async function startUserSession(userId, ctx) {
         puppeteer: { 
             headless: true,
             executablePath: chromePath,
-            // ⚡ إعدادات تسريع خرافية ⚡
+            // 🛑 إعدادات منع امتلاء الذاكرة (Memory Leak Protection) 🛑
             args: [
                 '--no-sandbox',
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-accelerated-2d-canvas',
                 '--no-first-run',
-                '--no-zygote',
-                '--single-process', 
+                '--single-process', // تشغيل عملية واحدة فقط
                 '--disable-gpu',
                 '--disable-extensions',
-                '--disable-software-rasterizer', // تعطيل الجرافيكس
-                '--mute-audio', // كتم الصوت
-                '--disable-notifications' // منع التنبيهات
+                '--disable-software-rasterizer',
+                '--mute-audio',
+                '--disable-notifications',
+                '--disable-background-networking',
+                '--disable-default-apps',
+                '--disable-sync', // تعطيل المزامنة الخلفية
+                '--renderer-process-limit=1', // إجبار كروم على استخدام تبويب واحد فقط
+                '--disable-features=site-per-process' // توفير هائل للرام
             ] 
         },
-        // زيادة وقت الصبر
-        authTimeoutMs: 120000, // 2 دقيقة
+        authTimeoutMs: 120000, 
         qrMaxRetries: 5,
     });
 
@@ -147,28 +149,28 @@ async function startUserSession(userId, ctx) {
                 const buffer = await qrcode.toBuffer(qr);
                 await ctx.deleteMessage().catch(()=>{});
                 await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز الآن**\n⚡ تمت معالجة الرمز.\nإذا تأخر الربط بعد المسح، انتظر قليلاً ولا تخرج.',
+                    caption: '📱 **امسح الرمز**\nتم تخفيف الإعدادات لضمان الاتصال.\nإذا تأخر قليلاً فهذا طبيعي.',
                     ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث الرمز', 'retry_login')]])
                 });
             } catch (e) {}
         }
     });
 
-    // ✅ حدث جديد: المصادقة تمت (قبل الجاهزية)
+    // عند نجاح المصادقة
     client.on('authenticated', () => {
         console.log(`✅ User ${userId} Authenticated!`);
-        if(ctx) ctx.reply('🔐 **تم التحقق!** جاري مزامنة الرسائل... (لا تغلق البوت)');
+        // لا نرسل رسالة هنا لتجنب تكرار التنبيهات، ننتظر الجاهزية
     });
 
     client.on('ready', () => {
         sessions[userId].status = 'READY';
         console.log(`✅ User ${userId} Ready!`);
-        if(ctx) bot.telegram.sendMessage(userId, '🎉 **تم الاتصال بنجاح!**\nالآن يمكنك استخدام البوت.').catch(()=>{});
+        if(ctx) bot.telegram.sendMessage(userId, '🎉 **تم الاتصال بنجاح!**\nالبوت جاهز الآن.').catch(()=>{});
     });
 
     client.on('auth_failure', () => { 
         sessions[userId].status = 'FAILED'; 
-        if(ctx) ctx.reply('❌ فشل الربط. حاول مرة أخرى.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
+        if(ctx) ctx.reply('❌ فشل.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
     });
 
     client.on('disconnected', (reason) => { 
@@ -192,16 +194,16 @@ async function startUserSession(userId, ctx) {
         await client.initialize(); 
     } catch (error) { 
         console.error(`❌ Error (${userId}):`, error.message);
-        if(ctx) ctx.reply('⚠️ السيرفر مضغوط. اضغط تحديث.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
+        if(ctx) ctx.reply('⚠️ الذاكرة ممتلئة، اضغط تحديث.', Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]]));
         await cleanupSession(userId);
     }
 }
 
 bot.action('retry_login', async (ctx) => {
     const userId = ctx.from.id.toString();
-    ctx.editMessageText('🧹 **تنظيف وإعادة محاولة...**').catch(()=>{});
+    ctx.editMessageText('🧹 **تنظيف الذاكرة...**').catch(()=>{});
     await cleanupSession(userId);
-    await sleep(3000);
+    await sleep(2000);
     await startUserSession(userId, ctx); 
 });
 
@@ -219,7 +221,7 @@ async function cleanupSession(userId) {
 }
 
 // ============================================================
-// 4. باقي الكود (كما هو)
+// 4. بقية الأوامر (كما هي)
 // ============================================================
 bot.use(async (ctx, next) => {
     if (!ctx.from) return next();
