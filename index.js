@@ -1,8 +1,7 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers, fetchLatestBaileysVersion, delay } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const fs = require('fs');
 const { Telegraf, Markup } = require('telegraf');
-const qrcode = require('qrcode');
 const mongoose = require('mongoose');
 const express = require('express');
 
@@ -11,48 +10,31 @@ const express = require('express');
 // ============================================================
 const app = express();
 const PORT = process.env.PORT || 10000;
-app.get('/', (req, res) => res.send('✅ Bot Running (Windows Signature)'));
+app.get('/', (req, res) => res.send('✅ Bot Running (Pairing Code Mode)'));
 app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
 
 // ============================================================
-// 2. إعدادات قاعدة البيانات
+// 2. إعدادات
 // ============================================================
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN; 
 const ADMIN_ID = process.env.ADMIN_ID; 
 const MONGO_URI = process.env.MONGO_URI;
 
-mongoose.connect(MONGO_URI).then(() => restoreSessions()).catch(e => console.log(e));
+mongoose.connect(MONGO_URI).then(() => console.log('✅ DB Connected')).catch(e => console.log(e));
 
 const User = mongoose.model('User', new mongoose.Schema({ _id: String, expiry: Number }));
-const Setting = mongoose.model('Setting', new mongoose.Schema({ key: String, value: String }));
 const Reply = mongoose.model('Reply', new mongoose.Schema({ userId: String, keyword: String, response: String }));
-const History = mongoose.model('History', new mongoose.Schema({ _id: String, date: Number }));
 
 const sessions = {}; 
-const userStates = {}; 
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-bot.catch((err) => console.log(`⚠️ Telegraf Error: ${err.message}`));
-
-async function restoreSessions() {
-    // تنظيف أولي لضمان عدم وجود ملفات تالفة من البداية
-    const authPath = './auth_info';
-    if (!fs.existsSync(authPath)) fs.mkdirSync(authPath);
-}
 
 // ============================================================
-// 3. محرك Baileys (هوية ويندوز)
+// 3. محرك Baileys (نظام رمز الربط)
 // ============================================================
-async function startBaileysSession(userId, ctx) {
-    if (sessions[userId] && sessions[userId].status === 'CONNECTING') return;
-
-    if (ctx) ctx.reply('🚀 **جاري الاتصال (Windows Mode)...**').catch(()=>{});
-
+async function startBaileysSession(userId, ctx, phoneNumber = null) {
+    // إزالة الجلسة القديمة لضمان بداية نظيفة
     const sessionDir = `./auth_info/session_${userId}`;
-    
-    // إذا كان المجلد موجوداً وفيه مشاكل، نحذفه ونبدأ نظيفاً
-    if (ctx && fs.existsSync(sessionDir)) {
+    if (!sessions[userId] && fs.existsSync(sessionDir) && phoneNumber) {
         fs.rmSync(sessionDir, { recursive: true, force: true });
     }
 
@@ -64,63 +46,47 @@ async function startBaileysSession(userId, ctx) {
         logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         auth: state,
-        // 🔥 التمويه: الظهور كمتصفح ويندوز عادي لتجنب الحظر
-        browser: ["Windows", "Chrome", "10.0"], 
+        browser: Browsers.ubuntu('Chrome'), // متصفح مستقر
         syncFullHistory: false,
-        connectTimeoutMs: 60000, 
-        keepAliveIntervalMs: 10000,
-        retryRequestDelayMs: 5000 
+        connectTimeoutMs: 60000,
+        defaultQueryTimeoutMs: 0, // انتظار لانهائي لمنع التعليق
+        keepAliveIntervalMs: 10000
     });
 
-    sessions[userId] = { sock, status: 'CONNECTING', selected: [], allGroups: [] };
+    sessions[userId] = { sock };
+
+    // 🔥 إذا طلب المستخدم رمز ربط (Pairing Code)
+    if (phoneNumber && !sock.authState.creds.registered) {
+        setTimeout(async () => {
+            try {
+                // تنسيق الرقم (حذف + والفراغات)
+                let cleanNumber = phoneNumber.replace(/[^0-9]/g, '');
+                const code = await sock.requestPairingCode(cleanNumber);
+                if (ctx) ctx.reply(`🔢 **رمز الربط الخاص بك:**\n\`${code}\`\n\n1. اذهب لواتساب > الأجهزة المرتبطة.\n2. اختر "الربط برقم الهاتف".\n3. ادخل هذا الرمز.`, { parse_mode: 'Markdown' });
+            } catch (e) {
+                if (ctx) ctx.reply('❌ حدث خطأ في طلب الرمز. تأكد أن الرقم صحيح مع المفتاح الدولي (مثال: 966500000000).');
+            }
+        }, 3000);
+    }
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        if (qr && ctx) {
-            try {
-                const buffer = await qrcode.toBuffer(qr);
-                await ctx.deleteMessage().catch(()=>{});
-                await ctx.replyWithPhoto({ source: buffer }, { 
-                    caption: '📱 **امسح الرمز**\nهوية الاتصال: Windows 10',
-                    ...Markup.inlineKeyboard([[Markup.button.callback('🔄 تحديث', 'retry_login')]])
-                });
-            } catch (e) {}
-        }
+        const { connection, lastDisconnect } = update;
 
         if (connection === 'close') {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
-            console.log(`❌ Status: ${statusCode}`);
             
-            // التعامل مع 515
-            if (statusCode === 515) {
-                console.log('⏳ 515 detected. Waiting 10s...');
-                // انتظار 10 ثواني كاملة (وليس 5) لتهدئة السيرفر
-                setTimeout(() => startBaileysSession(userId, null), 10000);
-                return;
-            }
-
-            if (statusCode === 401 || statusCode === 403 || statusCode === 405) {
-                delete sessions[userId];
-                if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                if (ctx) ctx.reply('⚠️ انتهت الجلسة. أعد المسح.');
-            } 
-            else if (statusCode !== DisconnectReason.loggedOut) {
+            // تجاهل وإعادة محاولة للأخطاء الشائعة
+            if (statusCode !== DisconnectReason.loggedOut) {
                 startBaileysSession(userId, null);
-            } 
-            else {
+            } else {
                 delete sessions[userId];
                 if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-                if (ctx) ctx.reply('❌ تم الخروج.');
+                if (ctx) ctx.reply('❌ تم تسجيل الخروج.');
             }
         } 
         else if (connection === 'open') {
             console.log(`✅ ${userId} Connected!`);
-            sessions[userId].status = 'READY';
-            if (ctx) {
-                try { await ctx.deleteMessage(); } catch(e){}
-                ctx.reply('✅ **تم الربط بنجاح!**', Markup.inlineKeyboard([[Markup.button.callback('📂 القائمة', 'main_menu')]]));
-            }
+            if (ctx) ctx.reply('✅ **تم الاتصال بنجاح!**\nالبوت جاهز الآن.', Markup.inlineKeyboard([[Markup.button.callback('🛠️ لوحة التحكم', 'main_menu')]]));
         }
     });
 
@@ -132,7 +98,6 @@ async function startBaileysSession(userId, ctx) {
         if (!msg.message || msg.key.fromMe) return;
         const text = msg.message.conversation || msg.message.extendedTextMessage?.text;
         if (!text) return;
-
         try {
             const reply = await Reply.findOne({ userId, keyword: { $regex: new RegExp(`^${text.trim()}$`, 'i') } });
             if (reply) await sock.sendMessage(msg.key.remoteJid, { text: reply.response }, { quoted: msg });
@@ -141,133 +106,76 @@ async function startBaileysSession(userId, ctx) {
 }
 
 // ============================================================
-// 4. القوائم
+// 4. واجهة المستخدم
 // ============================================================
-bot.use(async (ctx, next) => {
-    if (!ctx.from) return next();
-    const isAdmin = (ctx.from.id.toString() == ADMIN_ID);
-    if (!isAdmin) {
-        if (ctx.message && ['/start', '/reset'].includes(ctx.message.text)) return next();
-        const user = await User.findById(ctx.from.id.toString());
-        if (!user || user.expiry < Date.now()) return ctx.reply('⛔ اشتراكك منتهي.');
-    }
-    return next();
-});
-
-// تصفير الجلسة
-bot.command('reset', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const sessionDir = `./auth_info/session_${userId}`;
-    if (sessions[userId]) { try { sessions[userId].sock.end(); } catch(e){} delete sessions[userId]; }
-    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
-    ctx.reply('☢️ **تم التصفير.**');
-});
-
-async function showMainMenu(ctx) {
-    const isAdmin = (ctx.from.id.toString() == ADMIN_ID);
-    let buttons = [
-        [Markup.button.callback('🔗 ربط واتساب', 'open_dashboard')],
-        [Markup.button.callback('📂 الخدمات', 'services_menu')],
-        [Markup.button.callback('⏳ اشتراكي', 'check_my_sub')]
-    ];
-    if(isAdmin) buttons.push([Markup.button.callback('🛠️ المدير', 'admin_panel')]);
-    try { await ctx.editMessageText('👋 لوحة التحكم', Markup.inlineKeyboard(buttons)); } 
-    catch { await ctx.reply('👋 لوحة التحكم', Markup.inlineKeyboard(buttons)); }
-}
-
-bot.start((ctx) => showMainMenu(ctx));
-bot.action('main_menu', (ctx) => showMainMenu(ctx));
-bot.action('services_menu', (ctx) => {
-    ctx.editMessageText('📂 الخدمات:', Markup.inlineKeyboard([
-        [Markup.button.callback('📨 نشر', 'broadcast'), Markup.button.callback('⚙️ جروبات', 'fetch_groups')],
-        [Markup.button.callback('🤖 ردود', 'my_replies'), Markup.button.callback('🔙 رجوع', 'main_menu')]
+bot.start((ctx) => {
+    ctx.reply('👋 **مرحباً بك**\n\nبسبب مشاكل الكيو آر، يرجى استخدام **رمز الربط**.', 
+    Markup.inlineKeyboard([
+        [Markup.button.callback('📱 ربط برقم الهاتف (مضمون)', 'login_phone')],
+        [Markup.button.callback('❌ حذف الجلسة (Reset)', 'logout')]
     ]));
 });
 
-bot.action('open_dashboard', (ctx) => {
-    const s = sessions[ctx.from.id.toString()];
-    if (s && s.status === 'READY') ctx.reply('✅ متصل.', Markup.inlineKeyboard([[Markup.button.callback('❌ خروج', 'logout')]]));
-    else startBaileysSession(ctx.from.id.toString(), ctx);
+// طلب الرقم
+bot.action('login_phone', (ctx) => {
+    ctx.reply('📞 **أرسل رقم هاتفك الآن مع مفتاح الدولة.**\nمثال: `966512345678`\n(بدون علامة +)');
+    // نحفظ حالة المستخدم أنه ينتظر إدخال رقم
+    sessions[ctx.from.id] = { step: 'WAIT_PHONE' };
 });
 
-bot.action('retry_login', async (ctx) => {
+bot.action('logout', (ctx) => {
     const userId = ctx.from.id.toString();
-    const dir = `./auth_info/session_${userId}`;
-    if (sessions[userId]) delete sessions[userId];
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-    try { await ctx.deleteMessage(); } catch(e) {}
-    ctx.reply('🔄 محاولة جديدة...');
-    setTimeout(() => startBaileysSession(userId, ctx), 2000);
+    const sessionDir = `./auth_info/session_${userId}`;
+    if (sessions[userId]?.sock) { try{sessions[userId].sock.end()}catch(e){} }
+    if (fs.existsSync(sessionDir)) fs.rmSync(sessionDir, { recursive: true, force: true });
+    delete sessions[userId];
+    ctx.reply('✅ تم تنظيف الجلسة.');
 });
 
-bot.action('logout', async (ctx) => {
-    const userId = ctx.from.id.toString();
-    const dir = `./auth_info/session_${userId}`;
-    if (sessions[userId]) { try { sessions[userId].sock.end(); } catch(e){} delete sessions[userId]; }
-    if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
-    try { await ctx.deleteMessage(); } catch(e) {}
-    ctx.reply('✅ تم الخروج.');
+// القائمة الرئيسية (بعد الاتصال)
+bot.action('main_menu', (ctx) => {
+    ctx.editMessageText('📂 **الخدمات:**', Markup.inlineKeyboard([
+        [Markup.button.callback('🤖 إضافة رد تلقائي', 'add_rep_btn')],
+        [Markup.button.callback('📨 نشر رسالة', 'cast_btn')]
+    ]));
 });
 
-bot.action('fetch_groups', async (ctx) => {
-    const s = sessions[ctx.from.id.toString()];
-    if(!s || s.status !== 'READY') return ctx.reply('⚠️ غير متصل.');
-    await ctx.answerCbQuery('جاري التحميل...');
-    try {
-        const groups = await s.sock.groupFetchAllParticipating();
-        s.allGroups = Object.values(groups).map(g => ({ id: g.id, name: g.subject }));
-        const btns = s.allGroups.slice(0, 20).map(g => [Markup.button.callback(`${s.selected.includes(g.id)?'✅':'⬜'} ${g.name.substr(0,10)}`, `sel_${g.id}`)]);
-        btns.push([Markup.button.callback('✅ الكل', 'sel_all'), Markup.button.callback('❌ إلغاء', 'desel_all')]);
-        btns.push([Markup.button.callback('حفظ', 'done_sel')]);
-        ctx.editMessageText('اختر:', Markup.inlineKeyboard(btns));
-    } catch { ctx.reply('❌ فشل جلب الجروبات'); }
-});
-
-bot.action(/sel_(.+)/, (ctx) => {
-    const s = sessions[ctx.from.id.toString()];
-    const id = ctx.match[1];
-    s.selected.includes(id) ? s.selected = s.selected.filter(i=>i!==id) : s.selected.push(id);
-    bot.telegram.answerCbQuery(ctx.callbackQuery.id, 'تم').catch(()=>{});
-});
-bot.action('sel_all', (ctx) => { sessions[ctx.from.id.toString()].selected = sessions[ctx.from.id.toString()].allGroups.map(g => g.id); ctx.answerCbQuery('تم'); });
-bot.action('done_sel', (ctx) => { ctx.answerCbQuery('تم الحفظ'); showMainMenu(ctx); });
-
-bot.action('broadcast', (ctx) => {
-    if(!sessions[ctx.from.id.toString()]?.selected.length) return ctx.reply('⚠️ اختر جروبات.');
-    userStates[ctx.from.id.toString()] = { step: 'CAST' };
-    ctx.reply('📝 أرسل الرسالة:');
-});
-
+// معالجة النصوص (إدخال الرقم أو الأوامر)
 bot.on('text', async (ctx) => {
     const userId = ctx.from.id.toString();
-    const s = sessions[userId];
-    const state = userStates[userId];
+    const text = ctx.message.text;
 
-    if (state?.step === 'CAST' && s) {
-        ctx.reply('⏳ جاري النشر...');
-        for (const id of s.selected) { await s.sock.sendMessage(id, { text: ctx.message.text }); await sleep(1000); }
-        userStates[userId] = null;
-        ctx.reply('✅ تم النشر.');
+    // 1. إذا كان المستخدم يرسل رقمه للربط
+    if (sessions[userId]?.step === 'WAIT_PHONE') {
+        const phone = text.replace(/[^0-9]/g, ''); // تنظيف الرقم
+        if (phone.length < 10) return ctx.reply('⚠️ رقم خاطئ، حاول مرة أخرى.');
+        
+        ctx.reply('⏳ جاري طلب الرمز من واتساب...');
+        delete sessions[userId].step; // إنهاء الانتظار
+        startBaileysSession(userId, ctx, phone);
+        return;
     }
-    
-    if (state?.step === 'WAIT_KEYWORD') { state.tempKey = ctx.message.text; state.step = 'WAIT_REPLY'; return ctx.reply('الرد؟'); }
-    if (state?.step === 'WAIT_REPLY') { await Reply.create({ userId, keyword: state.tempKey, response: ctx.message.text }); userStates[userId]=null; return ctx.reply('تم.'); }
 
-    if (userId == ADMIN_ID && state?.step) {
-        if (state.step === 'ADM_SUB_ID') { await User.findByIdAndUpdate(ctx.message.text, { expiry: Date.now() + 30*86400000 }, { upsert:true }); ctx.reply('تم 30 يوم'); userStates[userId]=null; }
+    // 2. الردود التلقائية (إضافة)
+    if (text.startsWith('/add')) {
+        const args = text.split('|');
+        if(args.length < 2) return ctx.reply('استخدم: /add كلمة | رد');
+        await Reply.create({ userId, keyword: args[0].replace('/add','').trim(), response: args[1].trim() });
+        return ctx.reply('✅ تم الحفظ.');
+    }
+
+    // 3. النشر
+    if (text.startsWith('/cast')) {
+        const s = sessions[userId];
+        if(!s?.sock) return ctx.reply('⚠️ غير متصل.');
+        const msg = text.replace('/cast','').trim();
+        const groups = await s.sock.groupFetchAllParticipating();
+        for(let id of Object.keys(groups)) {
+            await s.sock.sendMessage(id, { text: msg });
+        }
+        return ctx.reply('✅ تم النشر.');
     }
 });
-
-// خدمات فرعية
-bot.action('my_replies', async (ctx) => {
-    const c = await Reply.countDocuments({ userId: ctx.from.id.toString() });
-    ctx.editMessageText(`الردود: ${c}`, Markup.inlineKeyboard([[Markup.button.callback('➕', 'add_rep'), Markup.button.callback('🔙', 'services_menu')]]));
-});
-bot.action('add_rep', (ctx) => { userStates[ctx.from.id] = { step: 'WAIT_KEYWORD' }; ctx.reply('الكلمة؟'); });
-bot.action('check_my_sub', (ctx) => ctx.reply('مشترك.'));
-bot.action('req_sub', (ctx) => ctx.reply('تم الطلب.'));
-bot.action('admin_panel', (ctx) => ctx.editMessageText('المدير:', Markup.inlineKeyboard([[Markup.button.callback('تفعيل', 'adm_add'), Markup.button.callback('🔙', 'main_menu')]])));
-bot.action('adm_add', (ctx) => { userStates[ADMIN_ID]={step:'ADM_SUB_ID'}; ctx.reply('الآيدي؟'); });
 
 bot.launch();
 process.once('SIGINT', () => bot.stop());
